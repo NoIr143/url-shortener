@@ -97,8 +97,9 @@ func TestMaliciousInputCorpus(t *testing.T) {
 		{"user-info credential leak", `{"destination":"https://user:pass@example.com/"}`, http.StatusBadRequest},
 		{"CRLF header injection attempt", "{\"destination\":\"https://example.com/\r\nSet-Cookie: evil=1\"}", http.StatusBadRequest},
 		{"embedded NUL byte", "{\"destination\":\"https://example.com/\\u0000hidden\"}", http.StatusBadRequest},
-		{"oversized 2049 chars", `{"destination":"https://example.com/` + strings.Repeat("a", 2049-len("https://example.com/")) + `"}`, http.StatusBadRequest},
-		{"exactly 2048 chars boundary", `{"destination":"https://example.com/` + strings.Repeat("a", 2048-len("https://example.com/")) + `"}`, http.StatusCreated},
+		{"oversized 2049 chars (limit+1)", `{"destination":"https://example.com/` + strings.Repeat("a", 2049-len("https://example.com/")) + `"}`, http.StatusBadRequest},
+		{"exactly 2048 chars boundary (limit)", `{"destination":"https://example.com/` + strings.Repeat("a", 2048-len("https://example.com/")) + `"}`, http.StatusCreated},
+		{"2047 chars boundary (limit-1)", `{"destination":"https://example.com/` + strings.Repeat("a", 2047-len("https://example.com/")) + `"}`, http.StatusCreated},
 	}
 
 	for _, tc := range cases {
