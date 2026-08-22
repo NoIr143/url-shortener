@@ -1,6 +1,6 @@
 # Infrastructure (OpenTofu)
 
-Per `ADR-015`: OpenTofu, remote encrypted state, no long-lived CI keys. This directory currently covers **T5-02 and T5-03's scope** — the remote-state backend, root environment scaffold, and GitHub Actions OIDC trust. It does not yet provision the VPC, compute, edge, or security services (`T5-05`/`T5-06`/`T5-07`); those add resources into `environments/dev` (and later a `prod`, if one is ever funded) as they land.
+Per `ADR-015`: OpenTofu, remote encrypted state, no long-lived CI keys. This directory currently covers **T5-02 through T5-05's scope** — the remote-state backend, root environment scaffold, GitHub Actions OIDC trust, ECR repositories, and a VPC/ALB/ECS-Fargate baseline. It does not yet provision the edge (Route 53/ACM/CloudFront/WAF) or the remaining security services (`T5-06`/`T5-07`); those add resources into `environments/dev` (and later a `prod`, if one is ever funded) as they land.
 
 ## Layout
 
@@ -13,15 +13,25 @@ infra/
                                yet to point a remote backend at).
   environments/
     dev/                       Root module for the dev environment. Remote S3 backend.
-                               Includes the dev-scoped GitHub Actions IAM role.
+                               Includes the dev-scoped GitHub Actions IAM role, four ECR
+                               repositories, a three-AZ VPC, public+internal ALBs, and an
+                               ECS/Fargate cluster with one service per deployment unit.
   modules/
     tags/                      Standard tag map, shared by every environment.
     github-actions-role/       Reusable OIDC-trust IAM role for one workflow/environment.
+    ecr-repository/            Reusable ECR repository (immutable tags, scan-on-push).
+    vpc/                       Three-AZ VPC: public+private subnets, IGW, single NAT GW.
+    alb/                       Reusable ALB (internet-facing or internal), HTTP-only for now.
+    ecs-service/               Reusable Fargate service: task def, execution/task IAM
+                               roles, security group, optional ALB target group/rule.
 
 .github/workflows/
   terraform-plan.yml           Runs `tofu plan` for infra/environments/dev on PRs that
                                touch infra/, authenticated via OIDC — no AWS key stored
                                in GitHub.
+  image-scan.yml                Builds and Trivy-scans each deployment-unit image on PRs
+                               that touch the Dockerfile/cmd/internal — fails on any
+                               CRITICAL/HIGH finding.
 ```
 
 ## Workflow
@@ -69,12 +79,21 @@ The IAM role's trust policy requires the OIDC token's `sub` claim to be exactly 
 
 ## What's actually been verified
 
-- `tofu validate` passes for `bootstrap` and `environments/dev`.
+- `tofu validate` passes for `bootstrap` and `environments/dev` (including the ECR, VPC, ALB, and ECS-service modules).
 - `tofu plan` for `bootstrap` was run for real against a live AWS account (`414987372853`) and produced a genuine, correct plan (`7 to add, 0 to change, 0 to destroy` — the state bucket, lock table, and the GitHub OIDC provider) — read-only, created nothing.
-- `tofu plan` for `environments/dev` requires the bootstrap to actually be applied first (the S3 backend it points to doesn't exist until then) — this is the expected chicken-and-egg dependency, not a bug. `tofu init -backend=false` was used instead to verify the module wiring (`environments/dev` → `modules/tags`, `modules/github-actions-role`) resolves correctly.
-- `terraform-plan.yml` passes `actionlint` with zero findings.
+- `tofu plan` for `environments/dev` requires the bootstrap to actually be applied first (the S3 backend it points to doesn't exist until then) — this is the expected chicken-and-egg dependency, not a bug, and applies equally to every resource added to this environment since (ECR, VPC, ALBs, ECS). `tofu init -backend=false` was used instead to verify the module wiring resolves correctly.
+- `terraform-plan.yml` and `image-scan.yml` both pass `actionlint` with zero findings.
 
 **Nothing has been applied.** No AWS resources and no GitHub repository settings exist because of this directory/workflow yet — that was an explicit scope decision, not an oversight. Run the bootstrap for real, then set the three repository variables above, when you're ready to actually stand this up.
+
+## VPC/ALB/ECS baseline (T5-05)
+
+- One VPC (`10.0.0.0/16`), three AZs, one public + one private subnet per AZ. A single NAT gateway (not one per AZ) is a deliberate cost/availability tradeoff for a self-funded MVP — see the comment in `modules/vpc/main.tf` for the residual risk this leaves.
+- Two ALBs (ADR-012): `public_alb` (internet-facing, 0.0.0.0/0 on the security group) fronts `creation`+`redirect`; `internal_alb` (no public IP/DNS, security group scoped to the VPC's own CIDR only) fronts `admin`. This is the actual "no public bypass" mechanism (NFR-SEC-004) — not `cmd/admin`'s loopback-bind default, which only matters for local/scaffold runs.
+- Both ALBs are **HTTP-only** right now — TLS/ACM/CloudFront is `T5-06`'s scope, not built here. Treat the public ALB as directly internet-reachable over plain HTTP until then; not a final production edge posture.
+- Four ECS/Fargate services, one per deployment unit, images sourced from the `T5-04` ECR repositories (`<repo>:latest` — no real image has ever been pushed there, since ECR itself has never been applied). `worker` gets no ALB attachment at all (no HTTP surface by design).
+- Each service gets its own ECS execution role (pull image, write logs) and an **empty** task role — real permissions (DynamoDB, ElastiCache/Valkey, KMS) are `T5-07`'s scope, added additively once known.
+- No DynamoDB or ElastiCache/Valkey resources are provisioned by any current task — the running application code's `DYNAMODB_ENDPOINT`/`VALKEY_ADDR` env vars are not set here and would fall back to their `localhost` defaults, which are wrong in a real deployment. This is a known gap in the task breakdown, not silently patched.
 
 ## Region
 

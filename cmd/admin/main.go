@@ -1,9 +1,14 @@
 // cmd/admin scaffolds the Abuse/Admin API deployment unit (ARC-004):
 // "Private/privileged deployment; deny by default; no public network
-// path except approved report channel." This binds only to localhost by
-// default, unlike the other three commands, as a boundary reminder — a
-// real deployment puts this behind an internal load balancer with no
-// public route at all (docs/TECH_STACK.md's internal ALB).
+// path except approved report channel." It binds to localhost by
+// default, unlike the other three commands, as a boundary reminder for
+// local/scaffold use. The real boundary is network-level, not the bind
+// address: infra/environments/dev/ecs.tf (T5-05) puts this behind an
+// internal ALB with no public IP/DNS and a security group that only
+// accepts traffic from inside the VPC — that's what actually enforces
+// "no public bypass". ADMIN_ADDR overrides the default so the task can
+// bind ":8083" in that deployment (the internal ALB reaches the task
+// over its ENI, not loopback, so 127.0.0.1 would be unreachable there).
 //
 // This is a scaffold, not a working service: it does not yet implement
 // suspend/reinstate/report handlers. Those require privileged
@@ -17,6 +22,7 @@ package main
 import (
 	"log"
 	"net/http"
+	"os"
 )
 
 func main() {
@@ -26,7 +32,10 @@ func main() {
 	// require the privileged-identity/MFA path from docs/decisions/DEC-005.md,
 	// none of which exists yet.
 
-	addr := "127.0.0.1:8083" // localhost-only: no public network path (ARC-004)
+	addr := os.Getenv("ADMIN_ADDR")
+	if addr == "" {
+		addr = "127.0.0.1:8083" // localhost-only default: safe for local/scaffold use
+	}
 	log.Printf("admin API scaffold listening on http://%s (ARC-004) — suspend/reinstate NOT implemented, see docs/THREAT_MODEL.md Gap G1", addr)
 	log.Fatal(http.ListenAndServe(addr, mux))
 }
