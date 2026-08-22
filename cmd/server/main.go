@@ -37,11 +37,23 @@ func newMemStore() *memStore {
 	return &memStore{byKey: map[string]string{}, byDest: map[string]string{}}
 }
 
+// errKeyCollision mirrors internal/mapping.ErrKeyCollision (T7-03) for
+// this in-memory store: the given shortKey already names a different
+// destination. Under this binary's own key-generation scheme (a single
+// shared, monotonically-incrementing counter — never reissued) this
+// should never actually happen, but Create must still detect and
+// reject it rather than silently overwrite an existing mapping
+// (BR-003) if it somehow did.
+var errKeyCollision = errors.New("memstore: short key already in use")
+
 func (s *memStore) Create(_ context.Context, shortKey, destination string) (bool, string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if existing, ok := s.byDest[destination]; ok {
 		return false, existing, nil
+	}
+	if _, taken := s.byKey[shortKey]; taken {
+		return false, "", errKeyCollision
 	}
 	s.byKey[shortKey] = destination
 	s.byDest[destination] = shortKey
@@ -66,6 +78,9 @@ type memRepositoryAdapter struct {
 func (a memRepositoryAdapter) Create(ctx context.Context, shortKey domain.ShortKey, destination domain.Destination) (domain.ShortKey, bool, error) {
 	created, resolvedKey, err := a.store.Create(ctx, shortKey.String(), destination.String())
 	if err != nil {
+		if errors.Is(err, errKeyCollision) {
+			return domain.ShortKey{}, false, application.ErrKeyCollision
+		}
 		return domain.ShortKey{}, false, err
 	}
 	key, err := domain.NewShortKey(resolvedKey)

@@ -121,8 +121,9 @@ func (s storeAdapter) Get(ctx context.Context, shortKey string) (string, bool, e
 // mappingRepositoryAdapter satisfies application.MappingRepository
 // (T6-03) over the same *mapping.Repository storeAdapter wraps,
 // translating its raw-string API to domain types and its
-// ErrDigestCollision into application.ErrConflict at exactly this
-// boundary — the use case itself never imports internal/mapping.
+// ErrDigestCollision/ErrKeyCollision into application.ErrConflict/
+// ErrKeyCollision (T7-03) at exactly this boundary — the use case
+// itself never imports internal/mapping.
 type mappingRepositoryAdapter struct {
 	repo *mapping.Repository
 }
@@ -130,10 +131,14 @@ type mappingRepositoryAdapter struct {
 func (a mappingRepositoryAdapter) Create(ctx context.Context, shortKey domain.ShortKey, destination domain.Destination) (domain.ShortKey, bool, error) {
 	result, err := a.repo.Create(ctx, shortKey.String(), destination.String())
 	if err != nil {
-		if errors.Is(err, mapping.ErrDigestCollision) {
+		switch {
+		case errors.Is(err, mapping.ErrDigestCollision):
 			return domain.ShortKey{}, false, application.ErrConflict
+		case errors.Is(err, mapping.ErrKeyCollision):
+			return domain.ShortKey{}, false, application.ErrKeyCollision
+		default:
+			return domain.ShortKey{}, false, err
 		}
-		return domain.ShortKey{}, false, err
 	}
 	committed, err := domain.NewShortKey(result.ShortKey)
 	if err != nil {
