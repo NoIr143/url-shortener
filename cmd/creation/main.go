@@ -16,13 +16,17 @@ package main
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"time"
 
 	"url-shortener/internal/api"
+	"url-shortener/internal/application"
 	"url-shortener/internal/base62"
+	"url-shortener/internal/domain"
 	"url-shortener/internal/keyalloc"
 	"url-shortener/internal/mapping"
 	"url-shortener/internal/webui"
@@ -92,7 +96,12 @@ func (g *sequentialKeyGen) Next() string {
 
 // storeAdapter adapts *mapping.Repository's CreateResult-returning
 // Create to the (created bool, resolvedKey string, err error) shape
-// internal/api.MappingStore and internal/webui.Store expect.
+// internal/webui.Store still expects. internal/api's own CreateHandler
+// (T6-04) no longer uses this path — it goes through
+// mappingRepositoryAdapter/application.CreationUseCase below instead.
+// webui's own migration onto the use case is T17-02's job, not this
+// one's (docs/poc/T6-03-creation-use-case.md Section 1) — kept exactly
+// as before.
 type storeAdapter struct {
 	repo *mapping.Repository
 }
@@ -109,6 +118,58 @@ func (s storeAdapter) Get(ctx context.Context, shortKey string) (string, bool, e
 	return s.repo.Get(ctx, shortKey)
 }
 
+// mappingRepositoryAdapter satisfies application.MappingRepository
+// (T6-03) over the same *mapping.Repository storeAdapter wraps,
+// translating its raw-string API to domain types and its
+// ErrDigestCollision into application.ErrConflict at exactly this
+// boundary — the use case itself never imports internal/mapping.
+type mappingRepositoryAdapter struct {
+	repo *mapping.Repository
+}
+
+func (a mappingRepositoryAdapter) Create(ctx context.Context, shortKey domain.ShortKey, destination domain.Destination) (domain.ShortKey, bool, error) {
+	result, err := a.repo.Create(ctx, shortKey.String(), destination.String())
+	if err != nil {
+		if errors.Is(err, mapping.ErrDigestCollision) {
+			return domain.ShortKey{}, false, application.ErrConflict
+		}
+		return domain.ShortKey{}, false, err
+	}
+	committed, err := domain.NewShortKey(result.ShortKey)
+	if err != nil {
+		return domain.ShortKey{}, false, fmt.Errorf("repository returned an invalid short key %q: %w", result.ShortKey, err)
+	}
+	return committed, result.Created, nil
+}
+
+// keyAllocatorAdapter satisfies application.KeyGenerator (T6-03) over
+// the same *keyalloc.Allocator sequentialKeyGen wraps — a second,
+// independent local lease buffer over the same underlying counter,
+// safe by the allocator's own design (POC-001: concurrent leasers never
+// receive overlapping ranges).
+type keyAllocatorAdapter struct {
+	alloc     *keyalloc.Allocator
+	leaseSize int64
+	next, end int64
+}
+
+func (a *keyAllocatorAdapter) Next() (domain.ShortKey, error) {
+	if a.next >= a.end {
+		lease, err := a.alloc.AcquireLease(context.Background(), a.leaseSize, 10)
+		if err != nil {
+			return domain.ShortKey{}, err
+		}
+		a.next, a.end = lease.Start, lease.End
+	}
+	id := a.next
+	a.next++
+	encoded, err := base62.Encode(id)
+	if err != nil {
+		return domain.ShortKey{}, err
+	}
+	return domain.NewShortKey(encoded)
+}
+
 func main() {
 	client := dynamoClient()
 	repo := mapping.New(client, "mapping", "destination_claim")
@@ -123,8 +184,13 @@ func main() {
 	}
 	keyGen := newSequentialKeyGen(alloc, 100).Next
 
+	useCase := application.NewCreationUseCase(
+		mappingRepositoryAdapter{repo: repo},
+		&keyAllocatorAdapter{alloc: alloc, leaseSize: 100},
+	)
+
 	createLimiter := api.NewIPRateLimiter(10, time.Minute)
-	createHandler := api.NewCreateHandler(store, keyGen, createLimiter)
+	createHandler := api.NewCreateHandler(useCase, createLimiter)
 	uiHandler := webui.New(store, keyGen, createLimiter)
 
 	mux := http.NewServeMux()
