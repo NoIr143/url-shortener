@@ -1,0 +1,56 @@
+name: terraform-plan
+
+# Runs `tofu plan` for the dev environment on any PR that touches
+# infra/. Authenticates to AWS via OIDC (ADR-015: no long-lived AWS key
+# stored as a GitHub secret) — permissions.id-token: write is what lets
+# this workflow request a short-lived OIDC token from GitHub, which AWS
+# STS exchanges for temporary credentials scoped to exactly the role
+# below.
+#
+# `environment: dev` is what makes the OIDC token's `sub` claim include
+# `environment:dev` — the IAM role's trust policy
+# (infra/environments/dev/github_oidc.tf) requires exactly that subject,
+# so a workflow run without this `environment:` line could not assume
+# the role even with a stolen token from this repo. GitHub creates an
+# unprotected "dev" environment the first time this runs if one doesn't
+# exist yet; add required reviewers/protection rules in
+# Settings > Environments whenever you're ready — this workflow does not
+# configure that for you.
+
+on:
+  pull_request:
+    paths:
+      - "infra/**"
+      - ".github/workflows/terraform-plan.yml"
+
+permissions:
+  id-token: write # required to request the OIDC token
+  contents: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    environment: dev
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: opentofu/setup-opentofu@v1
+        with:
+          tofu_version: "1.12.6"
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.DEV_TERRAFORM_PLAN_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: tofu init
+        working-directory: infra/environments/dev
+        run: |
+          tofu init \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="dynamodb_table=${{ vars.TF_LOCK_TABLE }}" \
+            -backend-config="region=us-east-1"
+
+      - name: tofu plan
+        working-directory: infra/environments/dev
+        run: tofu plan -no-color
