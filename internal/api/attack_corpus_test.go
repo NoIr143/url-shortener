@@ -13,27 +13,46 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"url-shortener/internal/application"
+	"url-shortener/internal/domain"
 )
 
+// fakeStore doubles as both Creator (T6-03/T6-04's application.Result
+// shape) and Resolver — the fake keyGen issues "k1", "k2", ... in
+// creation order, matching the pre-T6-04 fake exactly so every existing
+// corpus case's expectations still hold.
 type fakeStore struct {
-	mu     sync.Mutex
-	byKey  map[string]string
-	byDest map[string]string
+	mu      sync.Mutex
+	byKey   map[string]string
+	byDest  map[string]string
+	counter int
 }
 
 func newFakeStore() *fakeStore {
 	return &fakeStore{byKey: map[string]string{}, byDest: map[string]string{}}
 }
 
-func (f *fakeStore) Create(ctx context.Context, shortKey, destination string) (bool, string, error) {
+func (f *fakeStore) Create(ctx context.Context, destination domain.Destination) (application.Result, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if existing, ok := f.byDest[destination]; ok {
-		return false, existing, nil
+	destStr := destination.String()
+	if existing, ok := f.byDest[destStr]; ok {
+		key, err := domain.NewShortKey(existing)
+		if err != nil {
+			return application.Result{}, err
+		}
+		return application.Result{ShortKey: key, Created: false}, nil
 	}
-	f.byKey[shortKey] = destination
-	f.byDest[destination] = shortKey
-	return true, shortKey, nil
+	f.counter++
+	keyStr := "k" + strconv.Itoa(f.counter)
+	key, err := domain.NewShortKey(keyStr)
+	if err != nil {
+		return application.Result{}, err
+	}
+	f.byKey[keyStr] = destStr
+	f.byDest[destStr] = keyStr
+	return application.Result{ShortKey: key, Created: true}, nil
 }
 
 func (f *fakeStore) Get(ctx context.Context, shortKey string) (string, bool, error) {
@@ -55,13 +74,8 @@ type testHandlers struct {
 
 func newTestHandlers() testHandlers {
 	store := newFakeStore()
-	counter := 0
-	keyGen := func() string {
-		counter++
-		return "k" + strconv.Itoa(counter)
-	}
 	return testHandlers{
-		create:  NewCreateHandler(store, keyGen, NewIPRateLimiter(10, time.Minute)),
+		create:  NewCreateHandler(store, NewIPRateLimiter(10, time.Minute)),
 		resolve: NewResolveHandler(store, NewIPRateLimiter(100, time.Minute)),
 	}
 }

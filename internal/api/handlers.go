@@ -3,17 +3,22 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
+
+	"url-shortener/internal/application"
+	"url-shortener/internal/domain"
 )
 
 // Creator is the minimal surface the Creation API deployment unit
-// (ARC-002) needs. It intentionally does not include Get — the Creation
-// API and Redirect Resolver are separate deployment units per ADR-001,
-// and a Creation API instance has no business path that reads back a
-// mapping by key.
+// (ARC-002) needs — satisfied by *internal/application.CreationUseCase
+// (T6-03) in production. It intentionally does not include Get — the
+// Creation API and Redirect Resolver are separate deployment units per
+// ADR-001, and a Creation API instance has no business path that reads
+// back a mapping by key.
 type Creator interface {
-	Create(ctx context.Context, shortKey, destination string) (created bool, resolvedKey string, err error)
+	Create(ctx context.Context, destination domain.Destination) (application.Result, error)
 }
 
 // Resolver is the minimal surface the Redirect Resolver deployment unit
@@ -53,16 +58,16 @@ func clientIP(r *http.Request) string {
 	return r.RemoteAddr
 }
 
-// CreateHandler implements POST /api/v1/urls (ARC-002), per
-// docs/ACCEPTANCE_CRITERIA.md Part A.
+// CreateHandler implements POST /api/v1/urls (ARC-002; T6-04), per
+// docs/ACCEPTANCE_CRITERIA.md Part A and docs/decisions/DEC-009.md's
+// route/schema/error contract.
 type CreateHandler struct {
-	store   Creator
-	keyGen  func() string
+	useCase Creator
 	limiter *IPRateLimiter
 }
 
-func NewCreateHandler(store Creator, keyGen func() string, limiter *IPRateLimiter) *CreateHandler {
-	return &CreateHandler{store: store, keyGen: keyGen, limiter: limiter}
+func NewCreateHandler(useCase Creator, limiter *IPRateLimiter) *CreateHandler {
+	return &CreateHandler{useCase: useCase, limiter: limiter}
 }
 
 type createRequest struct {
@@ -74,6 +79,11 @@ type createResponse struct {
 	ShortURL string `json:"shortUrl"`
 }
 
+// Create validates the request into a domain.Destination (T6-02) and
+// delegates commit behavior entirely to the Creator (T6-03's
+// CreationUseCase in production) — this handler's own job is only
+// request/response translation and RFC 9457 error mapping (DEC-009),
+// not any of FR-004 to FR-008's actual commit logic.
 func (h *CreateHandler) Create(w http.ResponseWriter, r *http.Request) {
 	if !h.limiter.Allow(clientIP(r)) {
 		writeProblem(w, http.StatusTooManyRequests, "RATE_LIMITED", "Too many requests", "creation rate limit exceeded", true)
@@ -86,25 +96,36 @@ func (h *CreateHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := ValidateDestination(req.Destination); err != nil {
+	destination, err := domain.NewDestination(req.Destination)
+	if err != nil {
 		writeProblem(w, http.StatusBadRequest, "INVALID_DESTINATION", "Destination is not acceptable", err.Error(), false)
 		return
 	}
 
-	key := h.keyGen()
-	created, resolvedKey, err := h.store.Create(r.Context(), key, req.Destination)
+	result, err := h.useCase.Create(r.Context(), destination)
 	if err != nil {
+		// Both outcomes are safe to retry with the identical request
+		// (docs/decisions/DEC-009.md's timeout/retry contract) and both
+		// leave no resolvable key (FR-008) — they differ only in the
+		// stable `code` field so a client/operator can tell a
+		// commit-time conflict (rare — internal/mapping.ErrDigestCollision,
+		// effectively a SHA-256 collision) apart from a generic
+		// dependency failure, without it changing retry behavior.
+		if errors.Is(err, application.ErrConflict) {
+			writeProblem(w, http.StatusServiceUnavailable, "COMMIT_CONFLICT", "Could not safely commit", "", true)
+			return
+		}
 		writeProblem(w, http.StatusServiceUnavailable, "DEPENDENCY_UNAVAILABLE", "Temporary failure", "", true)
 		return
 	}
 
 	status := http.StatusOK
-	if created {
+	if result.Created {
 		status = http.StatusCreated
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(createResponse{ShortKey: resolvedKey, ShortURL: "https://short.example/" + resolvedKey})
+	_ = json.NewEncoder(w).Encode(createResponse{ShortKey: result.ShortKey.String(), ShortURL: "https://short.example/" + result.ShortKey.String()})
 }
 
 // ResolveHandler implements GET /{shortKey} (ARC-003), per

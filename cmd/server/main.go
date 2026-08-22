@@ -2,8 +2,10 @@
 // low-fidelity UI-006 prototype and manual usability walkthroughs
 // (T4-02). It uses an in-memory store, not the DynamoDB-backed
 // repository (internal/mapping) — this keeps the UI demo runnable
-// without Docker. A production build would inject *mapping.Repository
-// instead; both satisfy the same api.MappingStore/webui.Store interface.
+// without Docker. A production build (cmd/creation) injects
+// *mapping.Repository/*keyalloc.Allocator instead, through the same
+// application.CreationUseCase this binary also uses (T6-04) — both
+// satisfy webui.Store's own separate, still-unmigrated interface too.
 package main
 
 import (
@@ -17,6 +19,8 @@ import (
 	"time"
 
 	"url-shortener/internal/api"
+	"url-shortener/internal/application"
+	"url-shortener/internal/domain"
 	"url-shortener/internal/webui"
 )
 
@@ -51,22 +55,61 @@ func (s *memStore) Get(_ context.Context, shortKey string) (string, bool, error)
 	return d, ok, nil
 }
 
+// memRepositoryAdapter satisfies api.Creator (T6-04) over the same
+// *memStore webui.Store uses, so the JSON API and UI share one backing
+// store (IR-UI-001) — mirrors cmd/creation's mappingRepositoryAdapter
+// at demo scale.
+type memRepositoryAdapter struct {
+	store *memStore
+}
+
+func (a memRepositoryAdapter) Create(ctx context.Context, shortKey domain.ShortKey, destination domain.Destination) (domain.ShortKey, bool, error) {
+	created, resolvedKey, err := a.store.Create(ctx, shortKey.String(), destination.String())
+	if err != nil {
+		return domain.ShortKey{}, false, err
+	}
+	key, err := domain.NewShortKey(resolvedKey)
+	if err != nil {
+		return domain.ShortKey{}, false, err
+	}
+	return key, created, nil
+}
+
+// sharedCounter backs both the legacy keyGen closure (webui, unchanged)
+// and counterKeyGenerator (the JSON API's use case) so a key minted by
+// either path can never collide with one minted by the other.
+type sharedCounter struct {
+	mu      sync.Mutex
+	counter int64
+}
+
+func (c *sharedCounter) next() int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.counter++
+	return c.counter
+}
+
+type counterKeyGenerator struct{ counter *sharedCounter }
+
+func (g counterKeyGenerator) Next() (domain.ShortKey, error) {
+	return domain.NewShortKey("k" + strconv.FormatInt(g.counter.next(), 36))
+}
+
 func main() {
 	store := newMemStore()
 
-	var counter int64
-	var counterMu sync.Mutex
+	counter := &sharedCounter{}
 	keyGen := func() string {
-		counterMu.Lock()
-		defer counterMu.Unlock()
-		counter++
-		return "k" + strconv.FormatInt(counter, 36)
+		return "k" + strconv.FormatInt(counter.next(), 36)
 	}
+
+	useCase := application.NewCreationUseCase(memRepositoryAdapter{store: store}, counterKeyGenerator{counter: counter})
 
 	createLimiter := api.NewIPRateLimiter(10, time.Minute)
 	resolveLimiter := api.NewIPRateLimiter(100, time.Minute)
 
-	createHandler := api.NewCreateHandler(store, keyGen, createLimiter)
+	createHandler := api.NewCreateHandler(useCase, createLimiter)
 	resolveHandler := api.NewResolveHandler(store, resolveLimiter)
 	uiHandler := webui.New(store, keyGen, createLimiter)
 
