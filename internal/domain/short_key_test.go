@@ -67,3 +67,63 @@ func TestShortKey_ZeroValueNotConstructible(t *testing.T) {
 		t.Fatalf("expected the zero ShortKey's own String() to be rejected by NewShortKey, got err=%v", err)
 	}
 }
+
+// TestShortKey_ExhaustiveCasePreservation is T8-01's "supported
+// edge/client corpus preserves keys" evidence, exhaustive rather than
+// the single a/A pair TestShortKey_CaseSensitive already checks: for
+// every one of the 26 letters, the lowercase and uppercase single-char
+// keys must be distinct ShortKey values. NFR-COMP-001/DEC-010 requires
+// this to hold for every supported client/intermediary — proving it
+// holds for every letter position in this package's own type is the
+// part of that guarantee this repository actually controls; DEC-010's
+// remaining browser/proxy/CDN chain is out of this package's reach.
+func TestShortKey_ExhaustiveCasePreservation(t *testing.T) {
+	for c := 'a'; c <= 'z'; c++ {
+		lower, err := NewShortKey(string(c))
+		if err != nil {
+			t.Fatalf("NewShortKey(%q): unexpected error: %v", string(c), err)
+		}
+		upperChar := c - 'a' + 'A'
+		upper, err := NewShortKey(string(upperChar))
+		if err != nil {
+			t.Fatalf("NewShortKey(%q): unexpected error: %v", string(upperChar), err)
+		}
+		if lower == upper {
+			t.Errorf("expected %q and %q to be distinct ShortKey values, got equal", lower, upper)
+		}
+	}
+}
+
+// TestNewShortKey_ClientEdgeCaseCorpus covers realistic client-side
+// mistakes and edge inputs (accidental whitespace from copy-paste, a
+// visually-confusable-but-genuinely-different alphabet mix, embedded
+// control characters) that a real supported client or intermediary
+// could plausibly produce, beyond the basic invalid-character corpus
+// TestNewShortKey_InvalidCases already covers.
+func TestNewShortKey_ClientEdgeCaseCorpus(t *testing.T) {
+	invalid := []string{
+		" abc1234",    // leading whitespace (accidental copy-paste)
+		"abc1234 ",    // trailing whitespace
+		"   ",         // whitespace only
+		"abc\t1234",   // embedded tab
+		"abc\n1234",   // embedded newline
+		"abc\r\n1234", // embedded CRLF
+		"%6b1",        // a percent-encoded-looking string that was never actually decoded
+		"abc1234\x00", // embedded NUL
+	}
+	for _, s := range invalid {
+		if _, err := NewShortKey(s); !errors.Is(err, ErrInvalidShortKey) {
+			t.Errorf("NewShortKey(%q): expected ErrInvalidShortKey, got %v", s, err)
+		}
+	}
+
+	// "l1O0I" mixes visually similar-looking characters (lowercase L,
+	// digit one, uppercase O, digit zero, uppercase I) that are all
+	// distinct, valid alphabet members — DEC-012 accepts this
+	// visual-confusability risk rather than normalizing between them;
+	// the parser's job is only to accept it as one exact 5-character
+	// key, not to second-guess or normalize it.
+	if _, err := NewShortKey("l1O0I"); err != nil {
+		t.Errorf("NewShortKey(%q): expected success (valid alphabet, just visually confusable), got %v", "l1O0I", err)
+	}
+}
