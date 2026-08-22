@@ -1,12 +1,18 @@
 //go:build integration
 
-// Requires DynamoDB Local (docker compose -f docker-compose.yml up -d).
+// Requires DynamoDB Local by default: export DYNAMODB_ENDPOINT (e.g.
+// http://localhost:8000, docker compose -f docker-compose.yml up -d)
+// before running. If DYNAMODB_ENDPOINT is left unset, this talks to real
+// AWS DynamoDB instead, using the ambient AWS credential chain (T5-08's
+// ephemeral-AWS integration workflow) — never the static "local"
+// credentials below, which would silently fail against a real account.
 // Run with: go test -tags=integration ./internal/mapping/...
 package mapping
 
 import (
 	"context"
 	"fmt"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -19,6 +25,14 @@ import (
 
 func localClient(t *testing.T) *dynamodb.Client {
 	t.Helper()
+	endpoint, isLocal := os.LookupEnv("DYNAMODB_ENDPOINT")
+	if !isLocal {
+		cfg, err := awsconfig.LoadDefaultConfig(context.Background())
+		if err != nil {
+			t.Fatalf("load AWS config: %v", err)
+		}
+		return dynamodb.NewFromConfig(cfg)
+	}
 	cfg, err := awsconfig.LoadDefaultConfig(context.Background(),
 		awsconfig.WithRegion("us-east-1"),
 		awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider("local", "local", "")),
@@ -27,7 +41,21 @@ func localClient(t *testing.T) *dynamodb.Client {
 		t.Fatalf("load config: %v", err)
 	}
 	return dynamodb.NewFromConfig(cfg, func(o *dynamodb.Options) {
-		o.BaseEndpoint = aws.String("http://localhost:8000")
+		o.BaseEndpoint = aws.String(endpoint)
+	})
+}
+
+// deleteTable is real teardown for tests that create their own
+// uniquely-named table — without it, repeated runs against real AWS
+// (T5-08's ephemeral workflow) would accumulate orphaned tables forever.
+// Best-effort: a delete failure fails the test loudly rather than
+// silently leaking a real AWS resource.
+func deleteTable(t *testing.T, client *dynamodb.Client, table string) {
+	t.Helper()
+	t.Cleanup(func() {
+		if _, err := client.DeleteTable(context.Background(), &dynamodb.DeleteTableInput{TableName: aws.String(table)}); err != nil {
+			t.Errorf("cleanup: delete table %s: %v", table, err)
+		}
 	})
 }
 
@@ -35,10 +63,13 @@ func freshRepo(t *testing.T) *Repository {
 	t.Helper()
 	client := localClient(t)
 	suffix := time.Now().UnixNano()
-	r := New(client, fmt.Sprintf("repo_mapping_%d", suffix), fmt.Sprintf("repo_claim_%d", suffix))
+	mappingTable, claimTable := fmt.Sprintf("repo_mapping_%d", suffix), fmt.Sprintf("repo_claim_%d", suffix)
+	r := New(client, mappingTable, claimTable)
 	if err := r.EnsureTables(context.Background()); err != nil {
 		t.Fatalf("ensure tables: %v", err)
 	}
+	deleteTable(t, client, mappingTable)
+	deleteTable(t, client, claimTable)
 	return r
 }
 

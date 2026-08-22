@@ -1,15 +1,21 @@
 //go:build integration
 
-// This file requires a running DynamoDB Local instance
-// (docker compose -f docker-compose.yml up -d) and is excluded from the
-// default `go test ./...` run via the `integration` build tag, since it is
-// integration evidence for docs/decisions/DEC-012.md (POC-001), not a unit
-// test. Run with: go test -tags=integration ./internal/keyalloc/...
+// Requires DynamoDB Local by default: export DYNAMODB_ENDPOINT (e.g.
+// http://localhost:8000, docker compose -f docker-compose.yml up -d)
+// before running. If DYNAMODB_ENDPOINT is left unset, this talks to real
+// AWS DynamoDB instead, using the ambient AWS credential chain (T5-08's
+// ephemeral-AWS integration workflow) — never the static "local"
+// credentials below, which would silently fail against a real account.
+// Excluded from the default `go test ./...` run via the `integration`
+// build tag, since it is integration evidence for
+// docs/decisions/DEC-012.md (POC-001), not a unit test. Run with:
+// go test -tags=integration ./internal/keyalloc/...
 package keyalloc
 
 import (
 	"context"
 	"fmt"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -22,6 +28,14 @@ import (
 
 func localClient(t *testing.T) *dynamodb.Client {
 	t.Helper()
+	endpoint, isLocal := os.LookupEnv("DYNAMODB_ENDPOINT")
+	if !isLocal {
+		cfg, err := awsconfig.LoadDefaultConfig(context.Background())
+		if err != nil {
+			t.Fatalf("load AWS config: %v", err)
+		}
+		return dynamodb.NewFromConfig(cfg)
+	}
 	cfg, err := awsconfig.LoadDefaultConfig(context.Background(),
 		awsconfig.WithRegion("us-east-1"),
 		awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider("local", "local", "")),
@@ -30,7 +44,19 @@ func localClient(t *testing.T) *dynamodb.Client {
 		t.Fatalf("load config: %v", err)
 	}
 	return dynamodb.NewFromConfig(cfg, func(o *dynamodb.Options) {
-		o.BaseEndpoint = aws.String("http://localhost:8000")
+		o.BaseEndpoint = aws.String(endpoint)
+	})
+}
+
+// deleteTable is real teardown for tests that create their own
+// uniquely-named table — without it, repeated runs against real AWS
+// (T5-08's ephemeral workflow) would accumulate orphaned tables forever.
+func deleteTable(t *testing.T, client *dynamodb.Client, table string) {
+	t.Helper()
+	t.Cleanup(func() {
+		if _, err := client.DeleteTable(context.Background(), &dynamodb.DeleteTableInput{TableName: aws.String(table)}); err != nil {
+			t.Errorf("cleanup: delete table %s: %v", table, err)
+		}
 	})
 }
 
@@ -44,6 +70,7 @@ func TestConcurrentLeasesNeverOverlap(t *testing.T) {
 	if err := a.EnsureTable(context.Background()); err != nil {
 		t.Fatalf("ensure table: %v", err)
 	}
+	deleteTable(t, client, table)
 
 	const goroutines = 50
 	const leaseSize = 100
@@ -96,6 +123,7 @@ func TestExhaustionFailsSafely(t *testing.T) {
 	if err := a.EnsureTable(context.Background()); err != nil {
 		t.Fatalf("ensure table: %v", err)
 	}
+	deleteTable(t, client, table)
 
 	for i := 0; i < 3; i++ {
 		if _, err := a.AcquireLease(context.Background(), 10, 10); err != nil {
@@ -122,6 +150,7 @@ func TestStaleFencingTokenCannotSucceed(t *testing.T) {
 	if err := a.EnsureTable(context.Background()); err != nil {
 		t.Fatalf("ensure table: %v", err)
 	}
+	deleteTable(t, client, table)
 
 	// "Instance A" (maxRetries=1: it will not retry after losing the race,
 	// simulating a stale/partitioned holder that gives up immediately)

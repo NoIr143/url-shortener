@@ -6,7 +6,12 @@
 // it does not import internal/cache (that belongs to the Redirect
 // Resolver) or anything privileged-plane related.
 //
-// Requires DynamoDB Local (docker compose up -d dynamodb-local).
+// Local dev requires DynamoDB Local: export DYNAMODB_ENDPOINT (e.g.
+// http://localhost:8000) or run via docker-compose.yml, which sets it
+// automatically. If DYNAMODB_ENDPOINT is left unset (a real deployment,
+// e.g. the ECS task in infra/environments/dev/ecs.tf), this resolves
+// region/credentials from the real AWS default chain — the task's own
+// IAM role (T5-05/T5-07) — never the static local credentials below.
 package main
 
 import (
@@ -29,9 +34,13 @@ import (
 )
 
 func dynamoClient() *dynamodb.Client {
-	endpoint := os.Getenv("DYNAMODB_ENDPOINT")
-	if endpoint == "" {
-		endpoint = "http://localhost:8000"
+	endpoint, isLocal := os.LookupEnv("DYNAMODB_ENDPOINT")
+	if !isLocal {
+		cfg, err := awsconfig.LoadDefaultConfig(context.Background())
+		if err != nil {
+			log.Fatalf("load AWS config: %v", err)
+		}
+		return dynamodb.NewFromConfig(cfg)
 	}
 	cfg, err := awsconfig.LoadDefaultConfig(context.Background(),
 		awsconfig.WithRegion("us-east-1"),

@@ -1,13 +1,86 @@
 name: url-shortener-dev
 
+# Brings up the whole local stack with one command: `docker compose up
+# -d`. The four app services build from the same parameterized
+# Dockerfile T5-04 introduced and connect to dynamodb-local/valkey by
+# their Compose service names (DYNAMODB_ENDPOINT/VALKEY_ADDR) — not
+# localhost, since containers reach each other over the Compose network.
+# `docker compose down` tears the whole thing back down; state lives
+# only in the (in-memory) dynamodb-local and valkey containers, so
+# nothing here persists across a teardown.
+
 services:
   dynamodb-local:
     image: amazon/dynamodb-local:latest
     ports:
       - "8000:8000"
     command: ["-jar", "DynamoDBLocal.jar", "-inMemory", "-sharedDb"]
+    healthcheck:
+      # No -f: DynamoDB Local answers a bare GET with 400 (it expects a
+      # signed POST), which is a perfectly healthy response — a plain
+      # curl exit code of 0 (connected, got *a* response) is what
+      # "healthy" means here, not a 2xx status.
+      test: ["CMD", "curl", "-s", "-o", "/dev/null", "http://localhost:8000/"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
 
   valkey:
     image: valkey/valkey:8-alpine
     ports:
       - "6379:6379"
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  creation:
+    build:
+      context: .
+      args:
+        CMD_PATH: cmd/creation
+    ports:
+      - "8081:8081"
+    environment:
+      DYNAMODB_ENDPOINT: http://dynamodb-local:8000
+    depends_on:
+      dynamodb-local:
+        condition: service_healthy
+
+  redirect:
+    build:
+      context: .
+      args:
+        CMD_PATH: cmd/redirect
+    ports:
+      - "8082:8082"
+    environment:
+      DYNAMODB_ENDPOINT: http://dynamodb-local:8000
+      VALKEY_ADDR: valkey:6379
+    depends_on:
+      dynamodb-local:
+        condition: service_healthy
+      valkey:
+        condition: service_healthy
+
+  admin:
+    build:
+      context: .
+      args:
+        CMD_PATH: cmd/admin
+    ports:
+      - "8083:8083"
+    environment:
+      # Default (unset) is 127.0.0.1-only, unreachable from the host —
+      # correct in a real deployment (T5-05's internal ALB reaches it
+      # over its ENI), but useless for local `curl localhost:8083`.
+      # Compose is a local dev/test surface, not a production network
+      # boundary, so binding all interfaces here is fine.
+      ADMIN_ADDR: ":8083"
+
+  worker:
+    build:
+      context: .
+      args:
+        CMD_PATH: cmd/worker

@@ -4,7 +4,12 @@
 // does not import internal/keyalloc or internal/webui, and cannot create
 // a mapping even by mistake, since api.Resolver has no Create method.
 //
-// Requires DynamoDB Local and Valkey (docker compose up -d).
+// Local dev requires DynamoDB Local and Valkey: export DYNAMODB_ENDPOINT
+// and VALKEY_ADDR, or run via docker-compose.yml, which sets both
+// automatically. If DYNAMODB_ENDPOINT is left unset (a real deployment,
+// e.g. the ECS task in infra/environments/dev/ecs.tf), this resolves
+// region/credentials from the real AWS default chain — the task's own
+// IAM role (T5-05/T5-07) — never the static local credentials below.
 package main
 
 import (
@@ -26,9 +31,13 @@ import (
 )
 
 func dynamoClient() *dynamodb.Client {
-	endpoint := os.Getenv("DYNAMODB_ENDPOINT")
-	if endpoint == "" {
-		endpoint = "http://localhost:8000"
+	endpoint, isLocal := os.LookupEnv("DYNAMODB_ENDPOINT")
+	if !isLocal {
+		cfg, err := awsconfig.LoadDefaultConfig(context.Background())
+		if err != nil {
+			log.Fatalf("load AWS config: %v", err)
+		}
+		return dynamodb.NewFromConfig(cfg)
 	}
 	cfg, err := awsconfig.LoadDefaultConfig(context.Background(),
 		awsconfig.WithRegion("us-east-1"),
@@ -41,10 +50,15 @@ func dynamoClient() *dynamodb.Client {
 }
 
 func main() {
+	// No EnsureTables here, deliberately: redirect never writes a table
+	// into existence, only reads from tables cmd/creation already
+	// ensured — matching its own least-privilege IAM policy
+	// (docs/poc/T5-07-kms-secrets-taskroles-audit.md grants it GetItem
+	// only, never CreateTable). Calling EnsureTables here would both
+	// fatal-crash on startup in a real deployment (AccessDenied) and, in
+	// local Compose, race cmd/creation's own EnsureTables call on the
+	// same table names at container start.
 	repo := mapping.New(dynamoClient(), "mapping", "destination_claim")
-	if err := repo.EnsureTables(context.Background()); err != nil {
-		log.Fatalf("ensure tables: %v", err)
-	}
 
 	valkeyAddr := os.Getenv("VALKEY_ADDR")
 	if valkeyAddr == "" {

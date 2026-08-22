@@ -1,0 +1,47 @@
+name: ephemeral-integration-test
+
+# Manual only (workflow_dispatch) — this exercises real DynamoDB
+# transaction/IAM behavior that local emulators can't prove
+# (docs/TECH_STACK.md Section 6), which only means something if a real
+# AWS API call actually happens. Not run on every PR: each run is real
+# (if brief and self-cleaning) AWS usage, so triggering it is a
+# deliberate choice, not an automatic side effect of opening a PR.
+#
+# Prerequisite (one-time, manual): apply infra/environments/ephemeral to
+# create the OIDC-trusted role this workflow assumes, then set the
+# EPHEMERAL_CI_ROLE_ARN repository variable to its `ephemeral_ci_role_arn`
+# output. Until then this workflow cannot run — the same bootstrapping
+# order every OIDC role in this repo has required (T5-02/03/07).
+#
+# No DynamoDB table is created by this workflow itself: the
+# internal/mapping and internal/keyalloc *_integration_test.go suites
+# each create their own uniquely-named table and delete it in
+# t.Cleanup. DYNAMODB_ENDPOINT is deliberately left unset so those
+# tests' client-setup helpers resolve real AWS credentials/region from
+# this job's OIDC-federated role instead of DynamoDB Local
+# (docs/poc/T5-08-local-compose-ephemeral-aws.md).
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  integration-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.EPHEMERAL_CI_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Run DynamoDB integration tests against real AWS
+        run: go test -tags=integration -v ./internal/mapping/... ./internal/keyalloc/...
