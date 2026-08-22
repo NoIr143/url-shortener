@@ -20,10 +20,13 @@ import (
 func TestBackupRestoreReconcile(t *testing.T) {
 	client := localClient(t)
 	suffix := time.Now().UnixNano()
-	src := New(client, fmt.Sprintf("backup_src_mapping_%d", suffix), fmt.Sprintf("backup_src_claim_%d", suffix))
+	srcMappingTable, srcClaimTable := fmt.Sprintf("backup_src_mapping_%d", suffix), fmt.Sprintf("backup_src_claim_%d", suffix)
+	src := New(client, srcMappingTable, srcClaimTable)
 	if err := src.EnsureTables(context.Background()); err != nil {
 		t.Fatalf("ensure source tables: %v", err)
 	}
+	deleteTable(t, client, srcMappingTable)
+	deleteTable(t, client, srcClaimTable)
 
 	const n = 25
 	for i := 0; i < n; i++ {
@@ -42,10 +45,13 @@ func TestBackupRestoreReconcile(t *testing.T) {
 	// Simulate restoring into a freshly provisioned environment (new
 	// tables — the local substitute for "new AWS account/region" since
 	// DynamoDB Local has no cross-instance restore to exercise).
-	dst := New(client, fmt.Sprintf("backup_dst_mapping_%d", suffix), fmt.Sprintf("backup_dst_claim_%d", suffix))
+	dstMappingTable, dstClaimTable := fmt.Sprintf("backup_dst_mapping_%d", suffix), fmt.Sprintf("backup_dst_claim_%d", suffix)
+	dst := New(client, dstMappingTable, dstClaimTable)
 	if err := dst.EnsureTables(context.Background()); err != nil {
 		t.Fatalf("ensure destination tables: %v", err)
 	}
+	deleteTable(t, client, dstMappingTable)
+	deleteTable(t, client, dstClaimTable)
 	if err := dst.Restore(context.Background(), snapshot); err != nil {
 		t.Fatalf("restore: %v", err)
 	}

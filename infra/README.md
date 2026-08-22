@@ -1,6 +1,6 @@
 # Infrastructure (OpenTofu)
 
-Per `ADR-015`: OpenTofu, remote encrypted state, no long-lived CI keys. This directory currently covers **T5-02 through T5-07's scope** — the remote-state backend, root environment scaffold, GitHub Actions OIDC trust, ECR repositories, a VPC/ALB/ECS-Fargate baseline, a Route 53/ACM/CloudFront/WAF edge, and KMS/Secrets Manager/task-role/audit baseline. `T5-01` through `T5-07` are all now covered; further environment resources land here as later tasks (T6+) need them.
+Per `ADR-015`: OpenTofu, remote encrypted state, no long-lived CI keys. This directory currently covers **T5-01 through T5-08's scope** — the remote-state backend, root environment scaffold, GitHub Actions OIDC trust, ECR repositories, a VPC/ALB/ECS-Fargate baseline, a Route 53/ACM/CloudFront/WAF edge, a KMS/Secrets Manager/task-role/audit baseline, and a second, lightweight `ephemeral` environment for real-AWS integration testing. Further environment resources land here as later tasks (T6+) need them.
 
 **`environments/dev` requires a `domain_name` variable with no default** (`variables.tf`) — no domain has ever been registered or chosen for this project. Nothing here can even `plan`, let alone `apply`, until a real value is supplied at that time.
 
@@ -22,6 +22,10 @@ infra/
                                Secrets Manager secret, real least-privilege DynamoDB
                                policies on two task roles, an image-signing CI role, and
                                CloudTrail/GuardDuty/Security Hub.
+    ephemeral/                 Lightweight environment for T5-08's real-AWS integration
+                               testing: one OIDC-trusted IAM role, no DynamoDB tables of
+                               its own (the integration test suites self-provision and
+                               self-delete their own uniquely-named tables).
   modules/
     tags/                      Standard tag map, shared by every environment.
     github-actions-role/       Reusable OIDC-trust IAM role for one workflow/environment.
@@ -42,6 +46,9 @@ infra/
   image-scan.yml                Builds and Trivy-scans each deployment-unit image on PRs
                                that touch the Dockerfile/cmd/internal — fails on any
                                CRITICAL/HIGH finding.
+  ephemeral-integration-test.yml Manual-trigger only: runs internal/mapping and
+                               internal/keyalloc's real-AWS integration tests via the
+                               ephemeral environment's OIDC role.
 ```
 
 ## Workflow
@@ -89,10 +96,11 @@ The IAM role's trust policy requires the OIDC token's `sub` claim to be exactly 
 
 ## What's actually been verified
 
-- `tofu validate` passes for `bootstrap` and `environments/dev` (including the ECR, VPC, ALB, ECS-service, edge modules, and the T5-07 KMS/Secrets Manager/task-policy/audit resources) — this succeeds even though `domain_name` has no default, since `validate` checks syntax/type consistency only, not that every variable has a value.
+- `tofu validate` passes for `bootstrap`, `environments/dev` (including the ECR, VPC, ALB, ECS-service, edge modules, and the T5-07 KMS/Secrets Manager/task-policy/audit resources), and `environments/ephemeral` — this succeeds even though `dev`'s `domain_name` has no default, since `validate` checks syntax/type consistency only, not that every variable has a value.
 - `tofu plan` for `bootstrap` was run for real against a live AWS account (`414987372853`) and produced a genuine, correct plan (`7 to add, 0 to change, 0 to destroy` — the state bucket, lock table, and the GitHub OIDC provider) — read-only, created nothing.
-- `tofu plan` for `environments/dev` requires the bootstrap to actually be applied first (the S3 backend it points to doesn't exist until then) — this is the expected chicken-and-egg dependency, not a bug, and applies equally to every resource added to this environment since (ECR, VPC, ALBs, ECS, edge, KMS/Secrets/audit). `tofu init -backend=false` was used instead to verify the module wiring resolves correctly.
-- `terraform-plan.yml` and `image-scan.yml` both pass `actionlint` with zero findings.
+- `tofu plan` for `environments/dev` and `environments/ephemeral` requires the bootstrap to actually be applied first (the S3 backend both point to doesn't exist until then) — this is the expected chicken-and-egg dependency, not a bug, and applies equally to every resource added to `dev` since (ECR, VPC, ALBs, ECS, edge, KMS/Secrets/audit) and to the new `ephemeral` environment. `tofu init -backend=false` was used instead to verify module wiring resolves correctly in both.
+- `terraform-plan.yml`, `image-scan.yml`, and `ephemeral-integration-test.yml` all pass `actionlint` with zero findings.
+- The real-AWS integration-test path (`internal/mapping`/`internal/keyalloc`'s client helpers with `DYNAMODB_ENDPOINT` unset) was verified directly against a real AWS account from this local environment: it correctly resolved a real IAM identity and attempted a genuine `CreateTable` call, which was correctly denied (`AccessDeniedException` — no ephemeral role has been applied yet, so nothing was created). Confirms the credential-resolution fix works, without needing the ephemeral role itself to exist.
 
 **Nothing has been applied.** No AWS resources and no GitHub repository settings exist because of this directory/workflow yet — that was an explicit scope decision, not an oversight. Run the bootstrap for real, then set the three repository variables above, when you're ready to actually stand this up.
 
@@ -123,6 +131,15 @@ The IAM role's trust policy requires the OIDC token's `sub` claim to be exactly 
 - **A new GitHub Actions OIDC role** (`image_signing_role`, via the same `github-actions-role` module T5-03 established) trusted only for `repo:NoIr143/url-shortener:ref:refs/heads/main`, granted `kms:Sign`/`kms:GetPublicKey`/`kms:DescribeKey` on the `image_signing` key only. **No workflow uses this role yet** — deciding when signing should happen and wiring a workflow to call `cosign sign --key awskms:///<key-id>` with it is deliberate follow-up work.
 - **CloudTrail** (multi-region, log-file validation, KMS-encrypted, dedicated S3 bucket with a TLS-only + CloudTrail-service-only bucket policy), **GuardDuty** (detector enabled), **Security Hub** (account enabled, AWS Foundational Security Best Practices standard subscribed). **AWS Config is deliberately not built** — it needs a recorder, delivery channel, its own IAM role, and a chosen rule set, and no compliance rules have been decided for this project; adding it now would be scope growth disproportionate to this task.
 - **No live negative-access test was run** — that requires `apply` plus either a real unauthorized `AssumeRole`/API call attempt or the AWS IAM Policy Simulator against a real role ARN, neither of which exist under write-only scope. Every claim above is a structural/policy-document review, not a live test — same limitation this session has flagged for every prior AWS-touching task.
+
+## Local Compose + ephemeral AWS integration testing (T5-08)
+
+- **`docker compose up -d`** now runs the full local stack — all four deployment-unit services plus DynamoDB Local/Valkey, one command, `docker compose down` tears it all back down. See the repo root `README.md` for details, including a known first-request timing quirk right after cold start.
+- **A real bug was found and fixed while building this**: `cmd/redirect` called `EnsureTables()` on startup, racing `cmd/creation`'s own table creation in Compose, and — more importantly — contradicting its own least-privilege IAM policy from `T5-07` (which never grants `dynamodb:CreateTable`). It would have fatal-crashed on startup in a real deployment. Removed; redirect never creates tables, only reads ones `cmd/creation` already ensured.
+- **`cmd/creation`/`cmd/redirect`'s DynamoDB client credential resolution was also fixed**: previously both *always* used static `"local"`/`"local"` credentials regardless of `DYNAMODB_ENDPOINT`, meaning neither could ever have worked against real AWS — including the ECS task roles `T5-05`/`T5-07` built. Now: `DYNAMODB_ENDPOINT` set → local static credentials (unchanged Compose/docker behavior); unset → the real AWS default credential chain (the task's actual IAM role). The same fix was applied to `internal/mapping`'s and `internal/keyalloc`'s integration-test client helpers, which had the identical hardcoded-local-only problem.
+- **`infra/environments/ephemeral/`** provisions only an OIDC-trusted IAM role, scoped by resource-ARN wildcard to test-table naming conventions already in the codebase (`repo_*`, `backup_*`, `keyalloc_*`) — no DynamoDB tables of its own, since the integration test suites already self-provision and self-delete (`t.Cleanup`) their own uniquely-named tables per run.
+- **`.github/workflows/ephemeral-integration-test.yml`** is manual-trigger only (`workflow_dispatch`) — each run is real AWS usage (brief, self-cleaning, but real), so it's a deliberate trigger, not automatic on every PR. Requires the `EPHEMERAL_CI_ROLE_ARN` repository variable, same bootstrapping order as every other OIDC role here.
+- **Scope deliberately excludes WAF/autoscaling/failover** ephemeral testing (also named in `docs/TECH_STACK.md` Section 6) — that needs the fuller VPC/ALB/ECS/edge stack, a larger lift left as a future extension of this environment, not built now.
 
 ## Region
 

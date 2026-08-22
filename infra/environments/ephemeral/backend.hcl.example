@@ -1,0 +1,12 @@
+# Copy this file to backend.hcl (gitignored) and fill in the real values
+# from `tofu output` in infra/bootstrap, after running the bootstrap
+# module once. `key` is deliberately not set here — the one-time manual
+# apply that creates this environment's role uses a fixed key; the
+# ephemeral-integration-test.yml workflow supplies its own per-run key
+# instead, via -backend-config="key=...".
+#
+#   tofu init -backend-config=backend.hcl -backend-config="key=url-shortener/ephemeral/bootstrap/terraform.tfstate"
+
+bucket         = "url-shortener-tofu-state"
+dynamodb_table = "url-shortener-tofu-lock"
+region         = "us-east-1"
