@@ -24,6 +24,15 @@ import (
 // limit; enforced here as defense in depth, not the sole validation layer.
 var ErrDestinationTooLong = errors.New("mapping: destination exceeds 2048 characters")
 
+// ErrDigestCollision is returned by Create when an existing claim is
+// found for the same destination digest but with a genuinely different
+// stored destination — a SHA-256 collision or data corruption, not a
+// legitimate exact-repeat (ADR-007: never assume a digest alone proves
+// semantic equivalence). A sentinel, not an ad-hoc formatted error, so
+// callers (internal/application, T6-03) can distinguish this specific,
+// unresolvable outcome from a generic dependency failure.
+var ErrDigestCollision = errors.New("mapping: digest collision with non-equal destination")
+
 const maxDestinationLength = 2048
 
 // Repository stores Mappings and Destination Claims in two DynamoDB
@@ -149,7 +158,7 @@ func (r *Repository) Create(ctx context.Context, shortKey, destination string) (
 		if claim.Destination != destination {
 			// Digest collision with a different destination: fail closed
 			// rather than silently returning the wrong mapping.
-			return CreateResult{}, fmt.Errorf("mapping: digest collision with non-equal destination")
+			return CreateResult{}, ErrDigestCollision
 		}
 		return CreateResult{ShortKey: claim.ShortKey, Created: false}, nil
 	}
