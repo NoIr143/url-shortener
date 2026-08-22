@@ -1,0 +1,9 @@
+# Copy this file to backend.hcl (gitignored) and fill in the real values
+# from `tofu output` in infra/bootstrap, after running the bootstrap
+# module once. Then:
+#
+#   tofu init -backend-config=backend.hcl
+
+bucket         = "url-shortener-tofu-state"
+dynamodb_table = "url-shortener-tofu-lock"
+region         = "us-east-1"

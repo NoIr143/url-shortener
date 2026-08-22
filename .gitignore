@@ -17,3 +17,14 @@
 
 # Scratch/tmp
 /tmp/
+
+# OpenTofu/Terraform — local provider cache, plan output, and generated
+# per-machine backend config. .terraform.lock.hcl IS committed (pins
+# provider versions); everything below is not.
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+**/backend.hcl
+crash.log
+crash.*.log
