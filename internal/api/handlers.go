@@ -22,12 +22,11 @@ type Creator interface {
 }
 
 // Resolver is the minimal surface the Redirect Resolver deployment unit
-// (ARC-003) needs. It intentionally does not include Create — satisfied
-// by *internal/cache.RedirectCache in production (which itself has no
-// Create method), keeping the redirect path unable to accidentally
-// create a mapping.
+// (ARC-003) needs — satisfied by *internal/application.ResolveUseCase
+// (T8-02) in production. It intentionally does not include Create —
+// keeping the redirect path unable to accidentally create a mapping.
 type Resolver interface {
-	Get(ctx context.Context, shortKey string) (destination string, ok bool, err error)
+	Resolve(ctx context.Context, key domain.ShortKey) (application.ResolveResult, error)
 }
 
 // problemDetail is the RFC 9457 shape confirmed at docs/decisions/DEC-009.md.
@@ -40,7 +39,26 @@ type problemDetail struct {
 	Retryable bool   `json:"retryable"`
 }
 
+// setSecurityHeaders applies the response headers common to every
+// response this service sends (T8-03; NFR-SEC-003):
+//   - Cache-Control: no-store — no response here is safe for an
+//     intermediary to cache past this request. This matters even for
+//     errors: a cached 410 (Suspended) would survive a later
+//     reinstatement just as wrongly as a cached 301 would have survived
+//     a suspension (docs/decisions/DEC-002.md's entire rationale for
+//     choosing 302 over 301), and a cached 404 would survive a later
+//     creation of that same key.
+//   - X-Content-Type-Options: nosniff — a response body is never meant
+//     to be interpreted as anything other than its declared
+//     Content-Type; directly addresses NFR-SEC-003's "script execution
+//     in shipped error surfaces" concern.
+func setSecurityHeaders(w http.ResponseWriter) {
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+}
+
 func writeProblem(w http.ResponseWriter, status int, code, title, detail string, retryable bool) {
+	setSecurityHeaders(w)
 	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(problemDetail{
@@ -128,51 +146,65 @@ func (h *CreateHandler) Create(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(createResponse{ShortKey: result.ShortKey.String(), ShortURL: "https://short.example/" + result.ShortKey.String()})
 }
 
-// ResolveHandler implements GET /{shortKey} (ARC-003), per
+// ResolveHandler implements GET /{shortKey} (ARC-003; T8-03), per
 // docs/ACCEPTANCE_CRITERIA.md Part B.1.
 type ResolveHandler struct {
-	store   Resolver
+	useCase Resolver
 	limiter *IPRateLimiter
 }
 
-func NewResolveHandler(store Resolver, limiter *IPRateLimiter) *ResolveHandler {
-	return &ResolveHandler{store: store, limiter: limiter}
+func NewResolveHandler(useCase Resolver, limiter *IPRateLimiter) *ResolveHandler {
+	return &ResolveHandler{useCase: useCase, limiter: limiter}
 }
 
-// Resolve serves a redirect. The destination is placed in Location only
-// after passing ValidateDestination at creation time — this handler
-// additionally strips any control character as defense in depth
-// (NFR-SEC-003) even though none should ever be stored.
+// Resolve validates the path segment into a domain.ShortKey (T8-01)
+// and delegates entirely to the Resolver (T8-02's ResolveUseCase in
+// production) — this handler's own job is only request/response
+// translation and status mapping, not any of FR-009 to FR-016's actual
+// resolution logic.
+//
+// No manual control-character check on the destination is needed here
+// (unlike the pre-T8-02 version of this handler): domain.Destination
+// cannot be constructed with one — that's enforced at the point
+// ResolveUseCase's adapter reads the stored record, structurally, not
+// by a runtime check that has to remember to run.
 func (h *ResolveHandler) Resolve(w http.ResponseWriter, r *http.Request, shortKey string) {
 	if !h.limiter.Allow(clientIP(r)) {
 		writeProblem(w, http.StatusTooManyRequests, "RATE_LIMITED", "Too many requests", "resolution rate limit exceeded", true)
 		return
 	}
 
-	if err := ValidateShortKey(shortKey); err != nil {
+	key, err := domain.NewShortKey(shortKey)
+	if err != nil {
 		writeProblem(w, http.StatusBadRequest, "INVALID_KEY", "That key is not valid", "", false)
 		return
 	}
 
-	dest, ok, err := h.store.Get(r.Context(), shortKey)
+	result, err := h.useCase.Resolve(r.Context(), key)
 	if err != nil {
 		writeProblem(w, http.StatusServiceUnavailable, "DEPENDENCY_UNAVAILABLE", "Temporary failure", "", true)
 		return
 	}
-	if !ok {
+
+	switch result.Status {
+	case application.ResolveStatusActive:
+		setSecurityHeaders(w)
+		w.Header().Set("Location", result.Destination.String())
+		w.WriteHeader(http.StatusFound) // 302, docs/decisions/DEC-002.md
+	case application.ResolveStatusSuspended:
+		// FR-012: 410, no Location, no destination in the body —
+		// ResolveResult structurally has no Destination for this
+		// outcome (T8-02), so there is nothing here that could leak it.
+		writeProblem(w, http.StatusGone, "SUSPENDED_KEY", "That link is no longer active", "", false)
+	case application.ResolveStatusUnknown:
 		writeProblem(w, http.StatusNotFound, "UNKNOWN_KEY", "That link isn't valid", "", false)
-		return
+	default:
+		// Unreachable in practice: ResolveUseCase's own switch already
+		// fails closed (returns an error, handled above) for anything
+		// that isn't one of the three ResolveStatus constants — this
+		// default exists so a future new ResolveStatus value can't
+		// silently fall through to a redirect if this handler is ever
+		// not updated to match it (NFR-SAFE-001: fail closed, not open).
+		writeProblem(w, http.StatusServiceUnavailable, "DEPENDENCY_UNAVAILABLE", "Temporary failure", "", true)
 	}
-
-	for _, r := range dest {
-		if r < 0x20 || r == 0x7f {
-			// Should be unreachable given creation-time validation; fail
-			// closed rather than ever emitting a header-injection payload.
-			writeProblem(w, http.StatusInternalServerError, "CORRUPT_DESTINATION", "Stored destination failed a safety check", "", false)
-			return
-		}
-	}
-
-	w.Header().Set("Location", dest)
-	w.WriteHeader(http.StatusFound) // 302, docs/decisions/DEC-002.md
 }

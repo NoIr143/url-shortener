@@ -19,18 +19,29 @@ import (
 )
 
 // fakeStore doubles as both Creator (T6-03/T6-04's application.Result
-// shape) and Resolver — the fake keyGen issues "k1", "k2", ... in
-// creation order, matching the pre-T6-04 fake exactly so every existing
-// corpus case's expectations still hold.
+// shape) and Resolver (T8-02/T8-03's application.ResolveResult shape)
+// — the fake keyGen issues "k1", "k2", ... in creation order, matching
+// the pre-T6-04 fake exactly so every existing corpus case's
+// expectations still hold.
 type fakeStore struct {
-	mu      sync.Mutex
-	byKey   map[string]string
-	byDest  map[string]string
-	counter int
+	mu        sync.Mutex
+	byKey     map[string]string
+	byDest    map[string]string
+	suspended map[string]bool
+	counter   int
 }
 
 func newFakeStore() *fakeStore {
-	return &fakeStore{byKey: map[string]string{}, byDest: map[string]string{}}
+	return &fakeStore{byKey: map[string]string{}, byDest: map[string]string{}, suspended: map[string]bool{}}
+}
+
+// suspend marks an existing key Suspended for a test to exercise the
+// FR-012 outcome — no suspend functionality exists in production yet
+// (docs/THREAT_MODEL.md Gap G1), so this is test-only.
+func (f *fakeStore) suspend(shortKey string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.suspended[shortKey] = true
 }
 
 func (f *fakeStore) Create(ctx context.Context, destination domain.Destination) (application.Result, error) {
@@ -55,11 +66,22 @@ func (f *fakeStore) Create(ctx context.Context, destination domain.Destination) 
 	return application.Result{ShortKey: key, Created: true}, nil
 }
 
-func (f *fakeStore) Get(ctx context.Context, shortKey string) (string, bool, error) {
+func (f *fakeStore) Resolve(ctx context.Context, shortKey domain.ShortKey) (application.ResolveResult, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	d, ok := f.byKey[shortKey]
-	return d, ok, nil
+	keyStr := shortKey.String()
+	d, ok := f.byKey[keyStr]
+	if !ok {
+		return application.ResolveResult{Status: application.ResolveStatusUnknown}, nil
+	}
+	if f.suspended[keyStr] {
+		return application.ResolveResult{Status: application.ResolveStatusSuspended}, nil
+	}
+	dest, err := domain.NewDestination(d)
+	if err != nil {
+		return application.ResolveResult{}, err
+	}
+	return application.ResolveResult{Status: application.ResolveStatusActive, Destination: dest}, nil
 }
 
 // testHandlers bundles a CreateHandler and ResolveHandler over the same

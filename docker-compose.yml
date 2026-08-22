@@ -88,12 +88,14 @@ services:
       - "8082:8082"
     environment:
       DYNAMODB_ENDPOINT: http://dynamodb-local:8000
-      VALKEY_ADDR: valkey:6379
     depends_on:
       dynamodb-local:
         condition: service_healthy
-      valkey:
-        condition: service_healthy
+    # No Valkey wiring — T8-03 moved cmd/redirect onto a repository-only
+    # resolver (internal/application.ResolveUseCase, T8-02); Valkey
+    # cache-aside is T9-06's separate, later task, added back on top.
+    # The `valkey` service below stays defined (T9-06 will need it),
+    # just unused by `redirect` for now.
 
   admin:
     build:
