@@ -43,21 +43,34 @@ func (f *fakeStore) Get(ctx context.Context, shortKey string) (string, bool, err
 	return d, ok, nil
 }
 
-func newTestHandlers() *Handlers {
+// testHandlers bundles a CreateHandler and ResolveHandler over the same
+// fakeStore — standing in for cmd/creation and cmd/redirect being
+// separate deployment units that happen to share a backing store in
+// production (the real Repository/RedirectCache), not for one combined
+// Handlers type.
+type testHandlers struct {
+	create  *CreateHandler
+	resolve *ResolveHandler
+}
+
+func newTestHandlers() testHandlers {
 	store := newFakeStore()
 	counter := 0
 	keyGen := func() string {
 		counter++
 		return "k" + strconv.Itoa(counter)
 	}
-	return NewHandlers(store, keyGen, NewIPRateLimiter(10, time.Minute), NewIPRateLimiter(100, time.Minute))
+	return testHandlers{
+		create:  NewCreateHandler(store, keyGen, NewIPRateLimiter(10, time.Minute)),
+		resolve: NewResolveHandler(store, NewIPRateLimiter(100, time.Minute)),
+	}
 }
 
-func doCreate(h *Handlers, body string, remoteAddr string) *httptest.ResponseRecorder {
+func doCreate(h testHandlers, body string, remoteAddr string) *httptest.ResponseRecorder {
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/urls", strings.NewReader(body))
 	req.RemoteAddr = remoteAddr + ":12345"
 	rec := httptest.NewRecorder()
-	h.Create(rec, req)
+	h.create.Create(rec, req)
 	return rec
 }
 
@@ -121,7 +134,7 @@ func TestPathCaseNeverFolds(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/K1", nil)
 	req.RemoteAddr = "10.0.1.2:1"
 	rec2 := httptest.NewRecorder()
-	h.Resolve(rec2, req, "K1")
+	h.resolve.Resolve(rec2, req, "K1")
 	if rec2.Code != http.StatusNotFound {
 		t.Fatalf("expected case-folded key 'K1' to be unknown (distinct from 'k1'), got status %d", rec2.Code)
 	}
@@ -129,7 +142,7 @@ func TestPathCaseNeverFolds(t *testing.T) {
 	req2 := httptest.NewRequest(http.MethodGet, "/k1", nil)
 	req2.RemoteAddr = "10.0.1.3:1"
 	rec3 := httptest.NewRecorder()
-	h.Resolve(rec3, req2, "k1")
+	h.resolve.Resolve(rec3, req2, "k1")
 	if rec3.Code != http.StatusFound {
 		t.Fatalf("expected exact-case key 'k1' to resolve, got status %d", rec3.Code)
 	}
@@ -161,7 +174,7 @@ func TestInvalidShortKeySyntaxRejected(t *testing.T) {
 			req := httptest.NewRequest(http.MethodGet, "/resolve", nil)
 			req.RemoteAddr = "10.0.2.1:1"
 			rec := httptest.NewRecorder()
-			h.Resolve(rec, req, key)
+			h.resolve.Resolve(rec, req, key)
 			if rec.Code != http.StatusBadRequest {
 				t.Errorf("key %q: expected 400, got %d", key, rec.Code)
 			}
