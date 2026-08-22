@@ -1,6 +1,8 @@
 # Infrastructure (OpenTofu)
 
-Per `ADR-015`: OpenTofu, remote encrypted state, no long-lived CI keys. This directory currently covers **T5-02 through T5-05's scope** — the remote-state backend, root environment scaffold, GitHub Actions OIDC trust, ECR repositories, and a VPC/ALB/ECS-Fargate baseline. It does not yet provision the edge (Route 53/ACM/CloudFront/WAF) or the remaining security services (`T5-06`/`T5-07`); those add resources into `environments/dev` (and later a `prod`, if one is ever funded) as they land.
+Per `ADR-015`: OpenTofu, remote encrypted state, no long-lived CI keys. This directory currently covers **T5-02 through T5-06's scope** — the remote-state backend, root environment scaffold, GitHub Actions OIDC trust, ECR repositories, a VPC/ALB/ECS-Fargate baseline, and a Route 53/ACM/CloudFront/WAF edge. It does not yet provision the remaining security services (`T5-07`); those add resources into `environments/dev` (and later a `prod`, if one is ever funded) as they land.
+
+**`environments/dev` requires a `domain_name` variable with no default** (`variables.tf`) — no domain has ever been registered or chosen for this project. Nothing here can even `plan`, let alone `apply`, until a real value is supplied at that time.
 
 ## Layout
 
@@ -24,6 +26,10 @@ infra/
     alb/                       Reusable ALB (internet-facing or internal), HTTP-only for now.
     ecs-service/               Reusable Fargate service: task def, execution/task IAM
                                roles, security group, optional ALB target group/rule.
+    edge/                      Route 53 hosted zone, ACM certificate (DNS-validated),
+                               CloudFront distribution, and a WAFv2 Web ACL. Requires a
+                               second, us-east-1-pinned AWS provider (CloudFront/ACM
+                               constraint, independent of the environment's own region).
 
 .github/workflows/
   terraform-plan.yml           Runs `tofu plan` for infra/environments/dev on PRs that
@@ -79,9 +85,9 @@ The IAM role's trust policy requires the OIDC token's `sub` claim to be exactly 
 
 ## What's actually been verified
 
-- `tofu validate` passes for `bootstrap` and `environments/dev` (including the ECR, VPC, ALB, and ECS-service modules).
+- `tofu validate` passes for `bootstrap` and `environments/dev` (including the ECR, VPC, ALB, ECS-service, and edge modules) — this succeeds even though `domain_name` has no default, since `validate` checks syntax/type consistency only, not that every variable has a value.
 - `tofu plan` for `bootstrap` was run for real against a live AWS account (`414987372853`) and produced a genuine, correct plan (`7 to add, 0 to change, 0 to destroy` — the state bucket, lock table, and the GitHub OIDC provider) — read-only, created nothing.
-- `tofu plan` for `environments/dev` requires the bootstrap to actually be applied first (the S3 backend it points to doesn't exist until then) — this is the expected chicken-and-egg dependency, not a bug, and applies equally to every resource added to this environment since (ECR, VPC, ALBs, ECS). `tofu init -backend=false` was used instead to verify the module wiring resolves correctly.
+- `tofu plan` for `environments/dev` requires the bootstrap to actually be applied first (the S3 backend it points to doesn't exist until then) — this is the expected chicken-and-egg dependency, not a bug, and applies equally to every resource added to this environment since (ECR, VPC, ALBs, ECS, edge). `tofu init -backend=false` was used instead to verify the module wiring resolves correctly.
 - `terraform-plan.yml` and `image-scan.yml` both pass `actionlint` with zero findings.
 
 **Nothing has been applied.** No AWS resources and no GitHub repository settings exist because of this directory/workflow yet — that was an explicit scope decision, not an oversight. Run the bootstrap for real, then set the three repository variables above, when you're ready to actually stand this up.
@@ -94,6 +100,15 @@ The IAM role's trust policy requires the OIDC token's `sub` claim to be exactly 
 - Four ECS/Fargate services, one per deployment unit, images sourced from the `T5-04` ECR repositories (`<repo>:latest` — no real image has ever been pushed there, since ECR itself has never been applied). `worker` gets no ALB attachment at all (no HTTP surface by design).
 - Each service gets its own ECS execution role (pull image, write logs) and an **empty** task role — real permissions (DynamoDB, ElastiCache/Valkey, KMS) are `T5-07`'s scope, added additively once known.
 - No DynamoDB or ElastiCache/Valkey resources are provisioned by any current task — the running application code's `DYNAMODB_ENDPOINT`/`VALKEY_ADDR` env vars are not set here and would fall back to their `localhost` defaults, which are wrong in a real deployment. This is a known gap in the task breakdown, not silently patched.
+
+## Edge: Route 53/ACM/CloudFront/WAF (T5-06)
+
+- `module.edge` (`modules/edge/`) creates a Route 53 hosted zone, a DNS-validated ACM certificate, a CloudFront distribution fronting the public ALB, and a WAFv2 Web ACL — all keyed off `var.domain_name`, which has **no default** (see above).
+- **Caching is disabled** on the distribution (AWS managed "CachingDisabled" policy) for every response — a redirect can transition Active → Suspended and must reflect that within the 60-second target (`docs/decisions/DEC-008.md`); an independent CDN TTL would be a second, uncoordinated staleness source on top of the already-coordinated cache/invalidation design in `ARC-007`. See the comment in `modules/edge/main.tf` before changing this.
+- **CloudFront preserves path case by default** (`docs/decisions/DEC-010.md`'s case-preservation requirement) — nothing in this configuration rewrites, normalizes, or case-folds the request path; WAF rule evaluation may normalize a copy of the path internally for pattern matching, but never rewrites what's actually forwarded to the origin.
+- The two generic WAF managed rule groups (`AWSManagedRulesCommonRuleSet`, `AWSManagedRulesKnownBadInputsRuleSet`) start in **COUNT** (observe-only) mode — this project has no penetration-test or false-positive evidence yet (`docs/SRS.md` G-007) to justify BLOCK. The per-IP rate-based rule does actively block (that's its purpose).
+- **CloudFront-to-origin is plain HTTP**, not HTTPS — the public ALB has no HTTPS listener yet. The public-internet-facing hop (viewer → CloudFront) is full TLS; only the CloudFront → ALB hop over the AWS backbone is unencrypted. Closing this needs a second, regional ACM certificate and an ALB HTTPS listener — not built here.
+- If this is ever applied, `module.edge`'s `name_servers` output must be set as the domain's NS records at whatever registrar the domain is bought through — Route 53 is not authoritative for the domain until that happens, regardless of anything else here.
 
 ## Region
 
