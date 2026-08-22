@@ -90,6 +90,31 @@ func (a memRepositoryAdapter) Create(ctx context.Context, shortKey domain.ShortK
 	return key, created, nil
 }
 
+// memReaderAdapter satisfies application.MappingReader (T8-02) over the
+// same *memStore memRepositoryAdapter/webui use. This demo binary has
+// no suspend functionality at all (no admin UI is wired here), so
+// every mapping that exists is unconditionally Active — there is no
+// path that could ever produce ResolveStatusSuspended in cmd/server,
+// unlike cmd/creation+cmd/redirect's real DynamoDB-backed status field.
+type memReaderAdapter struct {
+	store *memStore
+}
+
+func (a memReaderAdapter) Get(ctx context.Context, shortKey domain.ShortKey) (domain.Destination, domain.Status, bool, error) {
+	destStr, ok, err := a.store.Get(ctx, shortKey.String())
+	if err != nil {
+		return domain.Destination{}, "", false, err
+	}
+	if !ok {
+		return domain.Destination{}, "", false, nil
+	}
+	dest, err := domain.NewDestination(destStr)
+	if err != nil {
+		return domain.Destination{}, "", false, err
+	}
+	return dest, domain.StatusActive, true, nil
+}
+
 // sharedCounter backs both the legacy keyGen closure (webui, unchanged)
 // and counterKeyGenerator (the JSON API's use case) so a key minted by
 // either path can never collide with one minted by the other.
@@ -124,8 +149,10 @@ func main() {
 	createLimiter := api.NewIPRateLimiter(10, time.Minute)
 	resolveLimiter := api.NewIPRateLimiter(100, time.Minute)
 
+	resolveUseCase := application.NewResolveUseCase(memReaderAdapter{store: store})
+
 	createHandler := api.NewCreateHandler(useCase, createLimiter)
-	resolveHandler := api.NewResolveHandler(store, resolveLimiter)
+	resolveHandler := api.NewResolveHandler(resolveUseCase, resolveLimiter)
 	uiHandler := webui.New(store, keyGen, createLimiter)
 
 	mux := http.NewServeMux()
