@@ -1,6 +1,6 @@
 # Infrastructure (OpenTofu)
 
-Per `ADR-015`: OpenTofu, remote encrypted state, no long-lived CI keys. This directory currently covers **T5-02 through T5-06's scope** — the remote-state backend, root environment scaffold, GitHub Actions OIDC trust, ECR repositories, a VPC/ALB/ECS-Fargate baseline, and a Route 53/ACM/CloudFront/WAF edge. It does not yet provision the remaining security services (`T5-07`); those add resources into `environments/dev` (and later a `prod`, if one is ever funded) as they land.
+Per `ADR-015`: OpenTofu, remote encrypted state, no long-lived CI keys. This directory currently covers **T5-02 through T5-07's scope** — the remote-state backend, root environment scaffold, GitHub Actions OIDC trust, ECR repositories, a VPC/ALB/ECS-Fargate baseline, a Route 53/ACM/CloudFront/WAF edge, and KMS/Secrets Manager/task-role/audit baseline. `T5-01` through `T5-07` are all now covered; further environment resources land here as later tasks (T6+) need them.
 
 **`environments/dev` requires a `domain_name` variable with no default** (`variables.tf`) — no domain has ever been registered or chosen for this project. Nothing here can even `plan`, let alone `apply`, until a real value is supplied at that time.
 
@@ -16,8 +16,12 @@ infra/
   environments/
     dev/                       Root module for the dev environment. Remote S3 backend.
                                Includes the dev-scoped GitHub Actions IAM role, four ECR
-                               repositories, a three-AZ VPC, public+internal ALBs, and an
-                               ECS/Fargate cluster with one service per deployment unit.
+                               repositories, a three-AZ VPC, public+internal ALBs, an
+                               ECS/Fargate cluster with one service per deployment unit,
+                               the edge (Route 53/ACM/CloudFront/WAF), three KMS keys, one
+                               Secrets Manager secret, real least-privilege DynamoDB
+                               policies on two task roles, an image-signing CI role, and
+                               CloudTrail/GuardDuty/Security Hub.
   modules/
     tags/                      Standard tag map, shared by every environment.
     github-actions-role/       Reusable OIDC-trust IAM role for one workflow/environment.
@@ -85,9 +89,9 @@ The IAM role's trust policy requires the OIDC token's `sub` claim to be exactly 
 
 ## What's actually been verified
 
-- `tofu validate` passes for `bootstrap` and `environments/dev` (including the ECR, VPC, ALB, ECS-service, and edge modules) — this succeeds even though `domain_name` has no default, since `validate` checks syntax/type consistency only, not that every variable has a value.
+- `tofu validate` passes for `bootstrap` and `environments/dev` (including the ECR, VPC, ALB, ECS-service, edge modules, and the T5-07 KMS/Secrets Manager/task-policy/audit resources) — this succeeds even though `domain_name` has no default, since `validate` checks syntax/type consistency only, not that every variable has a value.
 - `tofu plan` for `bootstrap` was run for real against a live AWS account (`414987372853`) and produced a genuine, correct plan (`7 to add, 0 to change, 0 to destroy` — the state bucket, lock table, and the GitHub OIDC provider) — read-only, created nothing.
-- `tofu plan` for `environments/dev` requires the bootstrap to actually be applied first (the S3 backend it points to doesn't exist until then) — this is the expected chicken-and-egg dependency, not a bug, and applies equally to every resource added to this environment since (ECR, VPC, ALBs, ECS, edge). `tofu init -backend=false` was used instead to verify the module wiring resolves correctly.
+- `tofu plan` for `environments/dev` requires the bootstrap to actually be applied first (the S3 backend it points to doesn't exist until then) — this is the expected chicken-and-egg dependency, not a bug, and applies equally to every resource added to this environment since (ECR, VPC, ALBs, ECS, edge, KMS/Secrets/audit). `tofu init -backend=false` was used instead to verify the module wiring resolves correctly.
 - `terraform-plan.yml` and `image-scan.yml` both pass `actionlint` with zero findings.
 
 **Nothing has been applied.** No AWS resources and no GitHub repository settings exist because of this directory/workflow yet — that was an explicit scope decision, not an oversight. Run the bootstrap for real, then set the three repository variables above, when you're ready to actually stand this up.
@@ -109,6 +113,16 @@ The IAM role's trust policy requires the OIDC token's `sub` claim to be exactly 
 - The two generic WAF managed rule groups (`AWSManagedRulesCommonRuleSet`, `AWSManagedRulesKnownBadInputsRuleSet`) start in **COUNT** (observe-only) mode — this project has no penetration-test or false-positive evidence yet (`docs/SRS.md` G-007) to justify BLOCK. The per-IP rate-based rule does actively block (that's its purpose).
 - **CloudFront-to-origin is plain HTTP**, not HTTPS — the public ALB has no HTTPS listener yet. The public-internet-facing hop (viewer → CloudFront) is full TLS; only the CloudFront → ALB hop over the AWS backbone is unencrypted. Closing this needs a second, regional ACM certificate and an ALB HTTPS listener — not built here.
 - If this is ever applied, `module.edge`'s `name_servers` output must be set as the domain's NS records at whatever registrar the domain is bought through — Route 53 is not authoritative for the domain until that happens, regardless of anything else here.
+
+## KMS / Secrets Manager / task roles / audit (T5-07)
+
+- **Real least-privilege task-role policies** for `creation` and `redirect`, replacing T5-05's empty placeholders — grounded in the actual DynamoDB calls each service's Go code makes (`internal/mapping`, `internal/keyalloc`), not a blanket policy. See the comment in `task-policies.tf` for the exact reasoning per table/action. `admin` and `worker` keep empty task roles — nothing in their scaffold code exercises any AWS permission yet.
+- **`dynamodb:CreateTable` is deliberately not granted**, even though `EnsureTables` in both `internal/mapping` and `internal/keyalloc` calls it on startup. A compromised task creating arbitrary tables is a real blast-radius risk; table provisioning belongs in IaC. This means `EnsureTables` would fail with `AccessDenied` against real AWS today — an honest gap, not silently patched, and it compounds the already-flagged absence of any DynamoDB-provisioning task.
+- **Three customer-managed KMS keys**, each for a narrow reason DEC-004's provider-managed-KMS default doesn't cover: `secrets` (per-secret access control the account-wide default Secrets Manager key can't express), `image_signing` (asymmetric, sign-only — closes the gap `docs/poc/T5-04-images-ecr.md` flagged: "a real deployment would use a managed KMS-backed signing identity ... not a static keypair"), `cloudtrail` (log-integrity encryption with an explicit CloudTrail-service-trusting key policy).
+- **One Secrets Manager secret** (`url-shortener/dev/valkey-auth-token`) created as an **empty container only** — no version, no fabricated value — since no ElastiCache/Valkey resource exists yet to have a real AUTH token. Demonstrates the mechanism (KMS-encrypted, IAM grant scoped to exactly this one secret ARN, on `creation`+`redirect` only) without inventing fake secret content.
+- **A new GitHub Actions OIDC role** (`image_signing_role`, via the same `github-actions-role` module T5-03 established) trusted only for `repo:NoIr143/url-shortener:ref:refs/heads/main`, granted `kms:Sign`/`kms:GetPublicKey`/`kms:DescribeKey` on the `image_signing` key only. **No workflow uses this role yet** — deciding when signing should happen and wiring a workflow to call `cosign sign --key awskms:///<key-id>` with it is deliberate follow-up work.
+- **CloudTrail** (multi-region, log-file validation, KMS-encrypted, dedicated S3 bucket with a TLS-only + CloudTrail-service-only bucket policy), **GuardDuty** (detector enabled), **Security Hub** (account enabled, AWS Foundational Security Best Practices standard subscribed). **AWS Config is deliberately not built** — it needs a recorder, delivery channel, its own IAM role, and a chosen rule set, and no compliance rules have been decided for this project; adding it now would be scope growth disproportionate to this task.
+- **No live negative-access test was run** — that requires `apply` plus either a real unauthorized `AssumeRole`/API call attempt or the AWS IAM Policy Simulator against a real role ARN, neither of which exist under write-only scope. Every claim above is a structural/policy-document review, not a live test — same limitation this session has flagged for every prior AWS-touching task.
 
 ## Region
 
