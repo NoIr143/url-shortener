@@ -1,0 +1,8 @@
+.git
+.github
+docs
+AGENTS.md
+CLAUDE.md
+infra
+*.md
+tmp
