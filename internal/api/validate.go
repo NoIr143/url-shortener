@@ -9,12 +9,18 @@ package api
 
 import (
 	"errors"
-	"net/url"
-	"regexp"
+
+	"url-shortener/internal/domain"
 )
 
 // Errors returned by ValidateDestination — deliberately distinct so callers
-// can map each to the confirmed 400 response without re-parsing.
+// can map each to the confirmed 400 response without re-parsing. Kept as
+// this package's own sentinel values (internal/webui switches on their
+// exact identity to render field-level UI copy — docs/UI_UX_DESIGN.md)
+// even though the validation itself now lives in internal/domain
+// (T6-02): ValidateDestination delegates to domain.NewDestination and
+// translates its error back to the matching value below, so this
+// package's public error identity never changes underneath its callers.
 var (
 	ErrDestinationEmpty    = errors.New("destination is required")
 	ErrDestinationTooLong  = errors.New("destination exceeds 2048 characters") // docs/decisions/DEC-007.md
@@ -24,57 +30,43 @@ var (
 	ErrControlCharacters   = errors.New("destination contains a disallowed control character")
 )
 
-const maxDestinationLength = 2048
-
 // ValidateDestination enforces docs/decisions/DEC-007.md's confirmed
-// profile: http/https only, absolute, <=2048 chars, no user-info, and no
-// control characters (defense in depth against header-injection attempts
-// via a crafted destination value that later flows into a Location
-// header).
+// profile — delegated to internal/domain.NewDestination (T6-02), the
+// single authoritative implementation, and translated back to this
+// package's own error values so existing callers (internal/webui's
+// error-message switch) keep working unchanged.
 func ValidateDestination(raw string) error {
-	if raw == "" {
+	_, err := domain.NewDestination(raw)
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, domain.ErrDestinationEmpty):
 		return ErrDestinationEmpty
-	}
-	if len(raw) > maxDestinationLength {
+	case errors.Is(err, domain.ErrDestinationTooLong):
 		return ErrDestinationTooLong
-	}
-	for _, r := range raw {
-		// Reject any ASCII control character, including CR/LF, TAB, and
-		// NUL — these have no legitimate place in a destination URL and
-		// are the building blocks of header-injection/response-splitting
-		// attempts if a destination is later echoed into an HTTP header.
-		if r < 0x20 || r == 0x7f {
-			return ErrControlCharacters
-		}
-	}
-
-	u, err := url.Parse(raw)
-	if err != nil {
-		return ErrRelativeDestination
-	}
-	if !u.IsAbs() {
-		return ErrRelativeDestination
-	}
-	if u.Scheme != "http" && u.Scheme != "https" {
+	case errors.Is(err, domain.ErrUnsupportedScheme):
 		return ErrUnsupportedScheme
-	}
-	if u.User != nil {
+	case errors.Is(err, domain.ErrRelativeDestination):
+		return ErrRelativeDestination
+	case errors.Is(err, domain.ErrUserInfoPresent):
 		return ErrUserInfoPresent
+	case errors.Is(err, domain.ErrControlCharacters):
+		return ErrControlCharacters
+	default:
+		return err
 	}
-	return nil
 }
 
-// shortKeyPattern is the confirmed case-sensitive alphabet from
-// AGENTS.md/DEC-012: digits, lowercase, uppercase, 1-7 characters within
-// the planned horizon (docs/SRS.md's seven-position derivation).
-var shortKeyPattern = regexp.MustCompile(`^[0-9a-zA-Z]{1,7}$`)
-
 // ErrInvalidShortKey is returned for a syntactically invalid key (FR-013).
+// Kept as this package's own sentinel for the same reason as the
+// destination errors above.
 var ErrInvalidShortKey = errors.New("short key is not syntactically valid")
 
-// ValidateShortKey enforces the confirmed alphabet and length bound.
+// ValidateShortKey enforces the confirmed alphabet and length bound —
+// delegated to internal/domain.NewShortKey (T6-02), the single
+// authoritative implementation.
 func ValidateShortKey(key string) error {
-	if !shortKeyPattern.MatchString(key) {
+	if _, err := domain.NewShortKey(key); err != nil {
 		return ErrInvalidShortKey
 	}
 	return nil
