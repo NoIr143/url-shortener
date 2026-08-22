@@ -1,10 +1,10 @@
-//go:build poc
+//go:build integration
 
 // This file requires a running DynamoDB Local instance
-// (docker compose -f docker-compose.poc.yml up -d) and is excluded from the
-// default `go test ./...` run via the `poc` build tag, since it is
+// (docker compose -f docker-compose.yml up -d) and is excluded from the
+// default `go test ./...` run via the `integration` build tag, since it is
 // integration evidence for docs/decisions/DEC-012.md (POC-001), not a unit
-// test. Run with: go test -tags=poc ./internal/keyalloc/...
+// test. Run with: go test -tags=integration ./internal/keyalloc/...
 package keyalloc
 
 import (
@@ -34,12 +34,12 @@ func localClient(t *testing.T) *dynamodb.Client {
 	})
 }
 
-// TestPOC001_ConcurrentLeasesNeverOverlap proves the central POC-001
+// TestConcurrentLeasesNeverOverlap proves the central POC-001
 // requirement: under concurrent allocation, no two allocator instances
 // receive overlapping numeric ranges (zero duplicate committed keys).
-func TestPOC001_ConcurrentLeasesNeverOverlap(t *testing.T) {
+func TestConcurrentLeasesNeverOverlap(t *testing.T) {
 	client := localClient(t)
-	table := fmt.Sprintf("poc001_concurrent_%d", time.Now().UnixNano())
+	table := fmt.Sprintf("keyalloc_concurrent_%d", time.Now().UnixNano())
 	a := New(client, table, 1_000_000)
 	if err := a.EnsureTable(context.Background()); err != nil {
 		t.Fatalf("ensure table: %v", err)
@@ -85,12 +85,12 @@ func TestPOC001_ConcurrentLeasesNeverOverlap(t *testing.T) {
 	t.Logf("PASS: %d concurrent goroutines received %d non-overlapping ranges of size %d", goroutines, len(intervals), leaseSize)
 }
 
-// TestPOC001_ExhaustionFailsSafely proves that once the configured ID
+// TestExhaustionFailsSafely proves that once the configured ID
 // space is exhausted, AcquireLease fails with ErrExhausted rather than
 // issuing an out-of-bound or overlapping range.
-func TestPOC001_ExhaustionFailsSafely(t *testing.T) {
+func TestExhaustionFailsSafely(t *testing.T) {
 	client := localClient(t)
-	table := fmt.Sprintf("poc001_exhaustion_%d", time.Now().UnixNano())
+	table := fmt.Sprintf("keyalloc_exhaustion_%d", time.Now().UnixNano())
 	// Small ID space: exactly 3 leases of size 10 fit (0-30), a 4th must fail.
 	a := New(client, table, 30)
 	if err := a.EnsureTable(context.Background()); err != nil {
@@ -110,14 +110,14 @@ func TestPOC001_ExhaustionFailsSafely(t *testing.T) {
 	t.Log("PASS: 4th lease correctly rejected with ErrExhausted after exactly filling a 30-id space with three 10-id leases")
 }
 
-// TestPOC001_StaleFencingTokenCannotSucceed simulates a split-brain
+// TestStaleFencingTokenCannotSucceed simulates a split-brain
 // scenario: two allocator "instances" observe the same counter state, one
 // successfully advances it, and the other's conditional write must fail
 // (fenced out) rather than silently issuing a range that overlaps the
 // winner's.
-func TestPOC001_StaleFencingTokenCannotSucceed(t *testing.T) {
+func TestStaleFencingTokenCannotSucceed(t *testing.T) {
 	client := localClient(t)
-	table := fmt.Sprintf("poc001_splitbrain_%d", time.Now().UnixNano())
+	table := fmt.Sprintf("keyalloc_splitbrain_%d", time.Now().UnixNano())
 	a := New(client, table, 1_000_000)
 	if err := a.EnsureTable(context.Background()); err != nil {
 		t.Fatalf("ensure table: %v", err)

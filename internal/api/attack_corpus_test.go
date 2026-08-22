@@ -61,10 +61,10 @@ func doCreate(h *Handlers, body string, remoteAddr string) *httptest.ResponseRec
 	return rec
 }
 
-// TestPOC004_MaliciousInputCorpus exercises the boundary/malicious corpus
+// TestMaliciousInputCorpus exercises the boundary/malicious corpus
 // required by docs/QUALITY_THRESHOLDS.md's NFR-SEC-003 threshold: 0
 // exploitable finding, every corpus case handled per contract.
-func TestPOC004_MaliciousInputCorpus(t *testing.T) {
+func TestMaliciousInputCorpus(t *testing.T) {
 	h := newTestHandlers()
 
 	cases := []struct {
@@ -107,9 +107,9 @@ func TestPOC004_MaliciousInputCorpus(t *testing.T) {
 	}
 }
 
-// TestPOC004_PathCaseNeverFolds proves short-key case-sensitivity survives
+// TestPathCaseNeverFolds proves short-key case-sensitivity survives
 // the handler layer end to end (NFR-COMP-001/DEC-012's Base62 alphabet).
-func TestPOC004_PathCaseNeverFolds(t *testing.T) {
+func TestPathCaseNeverFolds(t *testing.T) {
 	h := newTestHandlers()
 	rec := doCreate(h, `{"destination":"https://example.com/case-test"}`, "10.0.1.1")
 	if rec.Code != http.StatusCreated {
@@ -139,9 +139,9 @@ func TestPOC004_PathCaseNeverFolds(t *testing.T) {
 	t.Log("PASS: short-key case is preserved end to end; a case-folded variant does not resolve to the original mapping")
 }
 
-// TestPOC004_InvalidShortKeySyntaxRejected exercises the alphabet/length
+// TestInvalidShortKeySyntaxRejected exercises the alphabet/length
 // boundary corpus for the resolve path.
-func TestPOC004_InvalidShortKeySyntaxRejected(t *testing.T) {
+func TestInvalidShortKeySyntaxRejected(t *testing.T) {
 	h := newTestHandlers()
 	badKeys := []string{
 		"",
@@ -172,10 +172,10 @@ func TestPOC004_InvalidShortKeySyntaxRejected(t *testing.T) {
 	}
 }
 
-// TestPOC004_CreationRateLimitEnforced proves the layered rate control:
+// TestCreationRateLimitEnforced proves the layered rate control:
 // requests beyond the confirmed 10/min creation quota (DEC-005) receive
 // 429 without any mapping side effect.
-func TestPOC004_CreationRateLimitEnforced(t *testing.T) {
+func TestCreationRateLimitEnforced(t *testing.T) {
 	h := newTestHandlers()
 	ip := "10.0.3.1"
 

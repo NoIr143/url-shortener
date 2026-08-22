@@ -7,9 +7,9 @@ import (
 
 // IPRateLimiter is a minimal fixed-window per-IP limiter matching the
 // provisional quotas in docs/decisions/DEC-005.md (10 creation/min, 100
-// resolution/min per IP). It is POC-004 evidence that the *mechanism*
-// enforces a limit correctly — production would use a distributed store
-// (not in-process memory) once more than one instance runs.
+// resolution/min per IP). Tested to confirm the *mechanism* enforces a
+// limit correctly — production would use a distributed store (not
+// in-process memory) once more than one instance runs.
 type IPRateLimiter struct {
 	mu     sync.Mutex
 	limit  int

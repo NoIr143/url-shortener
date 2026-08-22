@@ -1,9 +1,9 @@
 // Package keyalloc implements the leased-numeric-range ID allocator
 // mandated by docs/decisions/DEC-012.md and specified as ARC-006 in
-// docs/SYSTEM_DESIGN.md. This is POC-001 evidence: it proves collision-free
-// concurrent allocation with a fencing token, and safe behavior at
-// exhaustion — it is not a production-hardened implementation (no retry
-// backoff tuning, no metrics, no observability).
+// docs/SYSTEM_DESIGN.md. Validated by integration tests proving
+// collision-free concurrent allocation with a fencing token, and safe
+// behavior at exhaustion — it is not a production-hardened implementation
+// (no retry backoff tuning, no metrics, no observability).
 package keyalloc
 
 import (
@@ -44,7 +44,7 @@ func New(client *dynamodb.Client, tableName string, maxID int64) *Allocator {
 }
 
 // EnsureTable creates the counter table if it does not already exist and
-// seeds the counter item at zero. Test/POC helper only.
+// seeds the counter item at zero. Test helper only.
 func (a *Allocator) EnsureTable(ctx context.Context) error {
 	_, err := a.client.CreateTable(ctx, &dynamodb.CreateTableInput{
 		TableName: aws.String(a.tableName),

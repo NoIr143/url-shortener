@@ -21,7 +21,7 @@ type snapshotRecord struct {
 }
 
 // Backup exports every Mapping and Destination Claim item as a JSON
-// snapshot. This is a POC-005 substitute for DynamoDB's managed
+// snapshot. This is a local-testing substitute for DynamoDB's managed
 // point-in-time recovery, which DynamoDB Local does not implement — it
 // proves the reconciliation *invariant* (DR-009: zero unexplained
 // differences after restore), not AWS's actual continuous-backup

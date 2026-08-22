@@ -1,7 +1,7 @@
 // cmd/server runs a vertical slice of the URL shortener for T4-01's
 // low-fidelity UI-006 prototype and manual usability walkthroughs
 // (T4-02). It uses an in-memory store, not the DynamoDB-backed
-// repository from the POC-002 work — this keeps the UI demo runnable
+// repository (internal/mapping) — this keeps the UI demo runnable
 // without Docker. A production build would inject *mapping.Repository
 // instead; both satisfy the same api.MappingStore/webui.Store interface.
 package main

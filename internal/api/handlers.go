@@ -9,7 +9,7 @@ import (
 
 // MappingStore is the minimal surface handlers need from the creation
 // path — satisfied by *mapping.Repository, expressed as an interface so
-// this package does not import mapping (keeping POC-004's HTTP-layer
+// this package does not import mapping (keeping this package's HTTP-layer
 // tests independent of a running DynamoDB Local instance).
 type MappingStore interface {
 	Create(ctx context.Context, shortKey, destination string) (created bool, resolvedKey string, err error)
@@ -36,7 +36,7 @@ func writeProblem(w http.ResponseWriter, status int, code, title, detail string,
 
 func clientIP(r *http.Request) string {
 	// Boundary-test helper: real deployments read this from the edge
-	// (ARC-001), not directly from RemoteAddr; POC-004 only needs a stable
+	// (ARC-001), not directly from RemoteAddr; tests only need a stable
 	// per-caller key for the rate-limit mechanism under test.
 	if idx := strings.LastIndex(r.RemoteAddr, ":"); idx >= 0 {
 		return r.RemoteAddr[:idx]
@@ -45,8 +45,8 @@ func clientIP(r *http.Request) string {
 }
 
 // Handlers wires the confirmed acceptance criteria (docs/ACCEPTANCE_CRITERIA.md)
-// to concrete HTTP behavior for POC-004's attack-corpus and rate-limit
-// tests.
+// to concrete HTTP behavior, exercised by this package's attack-corpus
+// and rate-limit tests.
 type Handlers struct {
 	store          MappingStore
 	keyGen         func() string

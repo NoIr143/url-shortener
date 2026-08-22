@@ -1,7 +1,7 @@
-//go:build poc
+//go:build integration
 
-// Requires Valkey (docker compose -f docker-compose.poc.yml up -d).
-// Run with: go test -tags=poc ./internal/cache/...
+// Requires Valkey (docker compose -f docker-compose.yml up -d).
+// Run with: go test -tags=integration ./internal/cache/...
 package cache
 
 import (
@@ -37,10 +37,10 @@ func uniqueKey(prefix string) string {
 	return fmt.Sprintf("%s_%d", prefix, time.Now().UnixNano())
 }
 
-// TestPOC003_MissThenHit proves the basic cache-aside contract: a first
+// TestMissThenHit proves the basic cache-aside contract: a first
 // read is a genuine miss (falls through to Source), a second read for the
 // same key is served from cache without calling Source again.
-func TestPOC003_MissThenHit(t *testing.T) {
+func TestMissThenHit(t *testing.T) {
 	rdb := newValkeyClient(t)
 	src := &fakeSource{data: map[string]string{"k1": "https://example.com/1"}}
 	c := New(rdb, src, time.Minute)
@@ -74,11 +74,11 @@ func TestPOC003_MissThenHit(t *testing.T) {
 	t.Log("PASS: first read = genuine miss (1 Source call), second read = cache hit (0 additional Source calls)")
 }
 
-// TestPOC003_HotKeyAbsorbedByCache proves the hot-key requirement
+// TestHotKeyAbsorbedByCache proves the hot-key requirement
 // (NFR-CAP-002's "representative hot-key mix"): many concurrent reads for
 // the same key should collapse to very few Source calls, not one per
 // request.
-func TestPOC003_HotKeyAbsorbedByCache(t *testing.T) {
+func TestHotKeyAbsorbedByCache(t *testing.T) {
 	rdb := newValkeyClient(t)
 	key := uniqueKey("hot")
 	src := &fakeSource{data: map[string]string{key: "https://example.com/hot"}}
@@ -110,10 +110,10 @@ func TestPOC003_HotKeyAbsorbedByCache(t *testing.T) {
 	t.Logf("PASS: %d concurrent hot-key reads produced 0 additional Source calls beyond the initial prime", concurrency)
 }
 
-// TestPOC003_CacheFailureFallsBackSafely simulates the cache being
+// TestCacheFailureFallsBackSafely simulates the cache being
 // unavailable (wrong address, immediate connection failure) and proves
 // reads still succeed via the authoritative Source rather than erroring.
-func TestPOC003_CacheFailureFallsBackSafely(t *testing.T) {
+func TestCacheFailureFallsBackSafely(t *testing.T) {
 	brokenRdb := redis.NewClient(&redis.Options{
 		Addr:        "localhost:1", // nothing listens here
 		DialTimeout: 200 * time.Millisecond,
@@ -135,12 +135,12 @@ func TestPOC003_CacheFailureFallsBackSafely(t *testing.T) {
 	t.Log("PASS: cache connection failure degraded safely to the authoritative Source, no error surfaced")
 }
 
-// TestPOC003_SuspensionPropagation measures explicit-invalidation latency
+// TestSuspensionPropagation measures explicit-invalidation latency
 // (the privileged suspend path) and confirms it is nowhere near the
 // 60-second target in docs/decisions/DEC-008.md — explicit invalidation is
 // the fast path; TTL expiry (not exercised here at the real 60s value, to
 // keep the test fast) is the worst-case bound.
-func TestPOC003_SuspensionPropagation(t *testing.T) {
+func TestSuspensionPropagation(t *testing.T) {
 	rdb := newValkeyClient(t)
 	key := uniqueKey("suspend")
 	src := &fakeSource{data: map[string]string{key: "https://example.com/before-suspend"}}

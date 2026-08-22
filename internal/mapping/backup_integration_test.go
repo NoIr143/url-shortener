@@ -1,4 +1,4 @@
-//go:build poc
+//go:build integration
 
 // POC-005 evidence, scoped to what is honestly testable against local
 // substitutes. See docs/poc/POC-005-results.md for what this explicitly
@@ -13,14 +13,14 @@ import (
 	"time"
 )
 
-// TestPOC005_BackupRestoreReconcile drills the restore/reconciliation
+// TestBackupRestoreReconcile drills the restore/reconciliation
 // invariant DR-009 requires: after backing up a populated repository and
 // restoring it into fresh tables, every mapping and claim must be present
 // with zero unexplained differences.
-func TestPOC005_BackupRestoreReconcile(t *testing.T) {
+func TestBackupRestoreReconcile(t *testing.T) {
 	client := localClient(t)
 	suffix := time.Now().UnixNano()
-	src := New(client, fmt.Sprintf("poc005_src_mapping_%d", suffix), fmt.Sprintf("poc005_src_claim_%d", suffix))
+	src := New(client, fmt.Sprintf("backup_src_mapping_%d", suffix), fmt.Sprintf("backup_src_claim_%d", suffix))
 	if err := src.EnsureTables(context.Background()); err != nil {
 		t.Fatalf("ensure source tables: %v", err)
 	}
@@ -42,7 +42,7 @@ func TestPOC005_BackupRestoreReconcile(t *testing.T) {
 	// Simulate restoring into a freshly provisioned environment (new
 	// tables — the local substitute for "new AWS account/region" since
 	// DynamoDB Local has no cross-instance restore to exercise).
-	dst := New(client, fmt.Sprintf("poc005_dst_mapping_%d", suffix), fmt.Sprintf("poc005_dst_claim_%d", suffix))
+	dst := New(client, fmt.Sprintf("backup_dst_mapping_%d", suffix), fmt.Sprintf("backup_dst_claim_%d", suffix))
 	if err := dst.EnsureTables(context.Background()); err != nil {
 		t.Fatalf("ensure destination tables: %v", err)
 	}

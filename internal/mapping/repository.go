@@ -2,8 +2,9 @@
 // DATA-001/DATA-002 in docs/SYSTEM_DESIGN.md and ADR-007: a Mapping and its
 // Destination Claim are committed atomically, giving exact-repeat
 // deduplication (docs/decisions/DEC-006.md) via a conditional write rather
-// than a read-then-write race. This is POC-002 evidence, not a
-// production-hardened repository (no pagination, no retry/backoff tuning).
+// than a read-then-write race. Validated by integration tests against a
+// local DynamoDB instance; not yet a production-hardened repository (no
+// pagination, no retry/backoff tuning).
 package mapping
 
 import (
@@ -37,7 +38,7 @@ func New(client *dynamodb.Client, mappingTable, claimTable string) *Repository {
 	return &Repository{client: client, mappingTable: mappingTable, claimTable: claimTable}
 }
 
-// EnsureTables creates both tables if they do not already exist. Test/POC
+// EnsureTables creates both tables if they do not already exist. Test
 // helper only — production table provisioning is infrastructure-as-code,
 // not application code.
 func (r *Repository) EnsureTables(ctx context.Context) error {

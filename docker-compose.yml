@@ -1,4 +1,4 @@
-name: url-shortener-poc
+name: url-shortener-dev
 
 services:
   dynamodb-local:

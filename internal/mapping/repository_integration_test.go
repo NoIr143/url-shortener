@@ -1,7 +1,7 @@
-//go:build poc
+//go:build integration
 
-// Requires DynamoDB Local (docker compose -f docker-compose.poc.yml up -d).
-// Run with: go test -tags=poc ./internal/mapping/...
+// Requires DynamoDB Local (docker compose -f docker-compose.yml up -d).
+// Run with: go test -tags=integration ./internal/mapping/...
 package mapping
 
 import (
@@ -35,17 +35,17 @@ func freshRepo(t *testing.T) *Repository {
 	t.Helper()
 	client := localClient(t)
 	suffix := time.Now().UnixNano()
-	r := New(client, fmt.Sprintf("poc002_mapping_%d", suffix), fmt.Sprintf("poc002_claim_%d", suffix))
+	r := New(client, fmt.Sprintf("repo_mapping_%d", suffix), fmt.Sprintf("repo_claim_%d", suffix))
 	if err := r.EnsureTables(context.Background()); err != nil {
 		t.Fatalf("ensure tables: %v", err)
 	}
 	return r
 }
 
-// TestPOC002_ConcurrentExactRepeatYieldsOneMapping proves FR-004/FR-005:
+// TestConcurrentExactRepeatYieldsOneMapping proves FR-004/FR-005:
 // at least 100 concurrent byte-identical creation requests must produce
 // exactly one active mapping and one returned key value.
-func TestPOC002_ConcurrentExactRepeatYieldsOneMapping(t *testing.T) {
+func TestConcurrentExactRepeatYieldsOneMapping(t *testing.T) {
 	r := freshRepo(t)
 	const destination = "https://example.com/very/specific/repeated/path?query=1"
 	const goroutines = 100
@@ -86,9 +86,9 @@ func TestPOC002_ConcurrentExactRepeatYieldsOneMapping(t *testing.T) {
 	t.Logf("PASS: %d concurrent exact-repeat requests converged on exactly one mapping and one key", goroutines)
 }
 
-// TestPOC002_DistinctDestinationsGetDistinctMappings is the negative case:
+// TestDistinctDestinationsGetDistinctMappings is the negative case:
 // two non-identical destinations must not collide.
-func TestPOC002_DistinctDestinationsGetDistinctMappings(t *testing.T) {
+func TestDistinctDestinationsGetDistinctMappings(t *testing.T) {
 	r := freshRepo(t)
 	res1, err := r.Create(context.Background(), "keyA", "https://example.com/a")
 	if err != nil {
@@ -103,11 +103,11 @@ func TestPOC002_DistinctDestinationsGetDistinctMappings(t *testing.T) {
 	}
 }
 
-// TestPOC002_ByteEquivalenceNotSemanticEquivalence proves DR-005: a
+// TestByteEquivalenceNotSemanticEquivalence proves DR-005: a
 // trailing-slash variant is a *different* destination under the confirmed
 // byte-equality rule (docs/decisions/DEC-006.md), so it gets its own
 // mapping rather than being silently merged.
-func TestPOC002_ByteEquivalenceNotSemanticEquivalence(t *testing.T) {
+func TestByteEquivalenceNotSemanticEquivalence(t *testing.T) {
 	r := freshRepo(t)
 	res1, err := r.Create(context.Background(), "keyC", "https://example.com/path")
 	if err != nil {
@@ -122,10 +122,10 @@ func TestPOC002_ByteEquivalenceNotSemanticEquivalence(t *testing.T) {
 	}
 }
 
-// TestPOC002_ReconciliationFindsNoOrphans is the local substitute for
+// TestReconciliationFindsNoOrphans is the local substitute for
 // DR-009 restore/reconciliation evidence (DynamoDB Local has no PITR to
 // exercise a true backup/restore drill against).
-func TestPOC002_ReconciliationFindsNoOrphans(t *testing.T) {
+func TestReconciliationFindsNoOrphans(t *testing.T) {
 	r := freshRepo(t)
 	for i := 0; i < 20; i++ {
 		key := fmt.Sprintf("recon%02d", i)

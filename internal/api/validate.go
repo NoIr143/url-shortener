@@ -1,9 +1,10 @@
 // Package api implements the public creation/resolution HTTP contract
-// finalized in docs/ACCEPTANCE_CRITERIA.md (T2-02/T2-03) and validated here
-// as POC-004 evidence: destination validation (docs/decisions/DEC-007.md),
-// short-key syntax (BR-002/BR-003), and per-IP rate limiting
-// (docs/decisions/DEC-005.md). Not a production-hardened service (no
-// distributed rate-limit store, no structured logging).
+// finalized in docs/ACCEPTANCE_CRITERIA.md (T2-02/T2-03) and tested here
+// against an attack/boundary corpus: destination validation
+// (docs/decisions/DEC-007.md), short-key syntax (BR-002/BR-003), and
+// per-IP rate limiting (docs/decisions/DEC-005.md). Not a
+// production-hardened service (no distributed rate-limit store, no
+// structured logging).
 package api
 
 import (

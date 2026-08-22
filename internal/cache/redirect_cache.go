@@ -2,8 +2,9 @@
 // ARC-007/DATA-004 in docs/SYSTEM_DESIGN.md: a bounded, disposable
 // derivative of the authoritative mapping repository (CLAUDE.md), never
 // itself the source of truth. TTL and explicit-invalidation propagation
-// target 60 seconds per docs/decisions/DEC-008.md. This is POC-003
-// evidence, not a production-hardened cache layer.
+// target 60 seconds per docs/decisions/DEC-008.md. Validated by
+// integration tests against a local Valkey instance; not yet a
+// production-hardened cache layer.
 package cache
 
 import (
