@@ -7,12 +7,21 @@ import (
 	"strings"
 )
 
-// MappingStore is the minimal surface handlers need from the creation
-// path — satisfied by *mapping.Repository, expressed as an interface so
-// this package does not import mapping (keeping this package's HTTP-layer
-// tests independent of a running DynamoDB Local instance).
-type MappingStore interface {
+// Creator is the minimal surface the Creation API deployment unit
+// (ARC-002) needs. It intentionally does not include Get — the Creation
+// API and Redirect Resolver are separate deployment units per ADR-001,
+// and a Creation API instance has no business path that reads back a
+// mapping by key.
+type Creator interface {
 	Create(ctx context.Context, shortKey, destination string) (created bool, resolvedKey string, err error)
+}
+
+// Resolver is the minimal surface the Redirect Resolver deployment unit
+// (ARC-003) needs. It intentionally does not include Create — satisfied
+// by *internal/cache.RedirectCache in production (which itself has no
+// Create method), keeping the redirect path unable to accidentally
+// create a mapping.
+type Resolver interface {
 	Get(ctx context.Context, shortKey string) (destination string, ok bool, err error)
 }
 
@@ -44,18 +53,16 @@ func clientIP(r *http.Request) string {
 	return r.RemoteAddr
 }
 
-// Handlers wires the confirmed acceptance criteria (docs/ACCEPTANCE_CRITERIA.md)
-// to concrete HTTP behavior, exercised by this package's attack-corpus
-// and rate-limit tests.
-type Handlers struct {
-	store          MappingStore
-	keyGen         func() string
-	createLimiter  *IPRateLimiter
-	resolveLimiter *IPRateLimiter
+// CreateHandler implements POST /api/v1/urls (ARC-002), per
+// docs/ACCEPTANCE_CRITERIA.md Part A.
+type CreateHandler struct {
+	store   Creator
+	keyGen  func() string
+	limiter *IPRateLimiter
 }
 
-func NewHandlers(store MappingStore, keyGen func() string, createLimiter, resolveLimiter *IPRateLimiter) *Handlers {
-	return &Handlers{store: store, keyGen: keyGen, createLimiter: createLimiter, resolveLimiter: resolveLimiter}
+func NewCreateHandler(store Creator, keyGen func() string, limiter *IPRateLimiter) *CreateHandler {
+	return &CreateHandler{store: store, keyGen: keyGen, limiter: limiter}
 }
 
 type createRequest struct {
@@ -67,9 +74,8 @@ type createResponse struct {
 	ShortURL string `json:"shortUrl"`
 }
 
-// Create implements POST /api/v1/urls per docs/ACCEPTANCE_CRITERIA.md Part A.
-func (h *Handlers) Create(w http.ResponseWriter, r *http.Request) {
-	if !h.createLimiter.Allow(clientIP(r)) {
+func (h *CreateHandler) Create(w http.ResponseWriter, r *http.Request) {
+	if !h.limiter.Allow(clientIP(r)) {
 		writeProblem(w, http.StatusTooManyRequests, "RATE_LIMITED", "Too many requests", "creation rate limit exceeded", true)
 		return
 	}
@@ -101,12 +107,23 @@ func (h *Handlers) Create(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(createResponse{ShortKey: resolvedKey, ShortURL: "https://short.example/" + resolvedKey})
 }
 
-// Resolve implements GET /{shortKey} per docs/ACCEPTANCE_CRITERIA.md Part B.1.
-// The destination is placed in Location only after passing ValidateDestination
-// at creation time — this handler additionally strips any control character
-// as defense in depth (NFR-SEC-003) even though none should ever be stored.
-func (h *Handlers) Resolve(w http.ResponseWriter, r *http.Request, shortKey string) {
-	if !h.resolveLimiter.Allow(clientIP(r)) {
+// ResolveHandler implements GET /{shortKey} (ARC-003), per
+// docs/ACCEPTANCE_CRITERIA.md Part B.1.
+type ResolveHandler struct {
+	store   Resolver
+	limiter *IPRateLimiter
+}
+
+func NewResolveHandler(store Resolver, limiter *IPRateLimiter) *ResolveHandler {
+	return &ResolveHandler{store: store, limiter: limiter}
+}
+
+// Resolve serves a redirect. The destination is placed in Location only
+// after passing ValidateDestination at creation time — this handler
+// additionally strips any control character as defense in depth
+// (NFR-SEC-003) even though none should ever be stored.
+func (h *ResolveHandler) Resolve(w http.ResponseWriter, r *http.Request, shortKey string) {
+	if !h.limiter.Allow(clientIP(r)) {
 		writeProblem(w, http.StatusTooManyRequests, "RATE_LIMITED", "Too many requests", "resolution rate limit exceeded", true)
 		return
 	}
