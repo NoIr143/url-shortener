@@ -37,6 +37,14 @@ docker compose down
 
 The very first request right after a cold `docker compose up` can occasionally 404 while DynamoDB Local finishes making a freshly-created table queryable across connections — retry once after a second or two. This is a known characteristic of the local emulator's table-creation propagation under fast concurrent container startup, not an application bug.
 
+Compose also brings up `localstack` — a broad local emulation of other AWS services (S3, SQS, EventBridge, Secrets Manager, KMS, and more) for future work. **No application code talks to it yet** — `cmd/worker` (ARC-009) is still an empty scaffold with no queue-consumer logic (ADR-005/ADR-014 Deferred). Point a real AWS SDK client at it locally with `AWS_ENDPOINT_URL=http://localhost:4566` plus any non-empty credentials (LocalStack does not check them), or with the AWS CLI:
+
+```bash
+aws --endpoint-url=http://localhost:4566 sqs create-queue --queue-name test-queue
+```
+
+Pinned to `localstack/localstack:3.8`, not `:latest` — the current `:latest` tag refuses to start at all without a paid Pro `LOCALSTACK_AUTH_TOKEN`, even for community-tier services. `3.8` starts license-free.
+
 **Unit tests** (no infrastructure required):
 
 ```bash

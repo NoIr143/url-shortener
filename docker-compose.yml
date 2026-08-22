@@ -35,6 +35,37 @@ services:
       timeout: 3s
       retries: 5
 
+  # Broad local AWS service emulation (LocalStack Community — the free
+  # services, not the Pro-only ones) for whatever future work needs it:
+  # ADR-014's outbox path (EventBridge/SQS), a place to exercise the
+  # KMS keys and Secrets Manager secret T5-07 created, S3, etc. No
+  # application code talks to this yet — cmd/worker (ARC-009) is still
+  # an empty scaffold (ADR-005/ADR-014 Deferred), and nothing else in
+  # this repo has a use for S3/SQS/EventBridge/Secrets Manager/KMS.
+  # This is available ahead of that need, not proof anything consumes
+  # it today. Point a real AWS SDK client at it locally with
+  # AWS_ENDPOINT_URL=http://localhost:4566 plus any non-empty
+  # credentials (LocalStack does not check them).
+  #
+  # Pinned to 3.8 deliberately, not :latest: the current :latest tag
+  # (verified 2026-08-22) refuses to start at all without a paid Pro
+  # LOCALSTACK_AUTH_TOKEN ("License activation failed"), even for
+  # community-tier services. 3.8.1 starts license-free
+  # ("edition": "community" on its own /_localstack/health) and was
+  # verified for real against sqs/s3/events/secretsmanager/kms.
+  localstack:
+    image: localstack/localstack:3.8
+    ports:
+      - "4566:4566"
+    environment:
+      - DEBUG=0
+      - PERSISTENCE=0
+    healthcheck:
+      test: ["CMD", "curl", "-s", "-f", "http://localhost:4566/_localstack/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
   creation:
     build:
       context: .
