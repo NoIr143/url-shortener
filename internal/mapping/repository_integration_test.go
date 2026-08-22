@@ -22,6 +22,7 @@ import (
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 )
 
 func localClient(t *testing.T) *dynamodb.Client {
@@ -133,6 +134,63 @@ func TestDistinctDestinationsGetDistinctMappings(t *testing.T) {
 	if !res1.Created || !res2.Created {
 		t.Fatalf("expected both distinct destinations to create new mappings: res1=%+v res2=%+v", res1, res2)
 	}
+}
+
+// TestGetWithStatus_DistinguishesActiveFromSuspended is T8-02's core
+// finding: the pre-existing Get() silently drops the stored status
+// field entirely — every existing mapping looks "resolvable" to it
+// regardless of status. GetWithStatus is the fix; this proves it
+// actually reports Suspended, not just Active, for a real stored
+// record — no suspend functionality exists yet to produce one through
+// normal use, so this seeds the Suspended row directly, the same
+// "poison a real record" technique T7-03 used to force a collision.
+func TestGetWithStatus_DistinguishesActiveFromSuspended(t *testing.T) {
+	r := freshRepo(t)
+
+	active, err := r.Create(context.Background(), "activeK", "https://example.com/active")
+	if err != nil {
+		t.Fatalf("create active mapping: %v", err)
+	}
+
+	const suspendedKey = "suspendK"
+	const suspendedDest = "https://example.com/suspended"
+	_, err = r.client.PutItem(context.Background(), &dynamodb.PutItemInput{
+		TableName: aws.String(r.mappingTable),
+		Item: map[string]types.AttributeValue{
+			"pk":          &types.AttributeValueMemberS{Value: suspendedKey},
+			"destination": &types.AttributeValueMemberS{Value: suspendedDest},
+			"status":      &types.AttributeValueMemberS{Value: "Suspended"},
+			"version":     &types.AttributeValueMemberN{Value: "2"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("seed suspended mapping directly: %v", err)
+	}
+
+	activeRecord, found, err := r.GetWithStatus(context.Background(), active.ShortKey)
+	if err != nil {
+		t.Fatalf("GetWithStatus(active): unexpected error: %v", err)
+	}
+	if !found || activeRecord.Status != "Active" || activeRecord.Destination != "https://example.com/active" {
+		t.Fatalf("expected an Active record for %q, got found=%v record=%+v", active.ShortKey, found, activeRecord)
+	}
+
+	suspendedRecord, found, err := r.GetWithStatus(context.Background(), suspendedKey)
+	if err != nil {
+		t.Fatalf("GetWithStatus(suspended): unexpected error: %v", err)
+	}
+	if !found || suspendedRecord.Status != "Suspended" || suspendedRecord.Destination != suspendedDest {
+		t.Fatalf("expected a Suspended record for %q, got found=%v record=%+v", suspendedKey, found, suspendedRecord)
+	}
+
+	_, found, err = r.GetWithStatus(context.Background(), "totallyUnknownKey")
+	if err != nil {
+		t.Fatalf("GetWithStatus(unknown): unexpected error: %v", err)
+	}
+	if found {
+		t.Fatalf("expected found=false for a genuinely unknown key")
+	}
+	t.Log("PASS: GetWithStatus correctly distinguished Active, Suspended, and unknown for real stored records")
 }
 
 // TestByteEquivalenceNotSemanticEquivalence proves DR-005: a

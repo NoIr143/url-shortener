@@ -196,7 +196,11 @@ func (r *Repository) Create(ctx context.Context, shortKey, destination string) (
 }
 
 // Get returns the stored destination for a short key, or ok=false if no
-// mapping exists.
+// mapping exists. It deliberately does not report status — callers
+// that need to distinguish Active from Suspended (T8-02's "safe status
+// outcomes", BR-007/FR-012) must use GetWithStatus instead. Kept
+// unchanged for existing callers (internal/cache.RedirectCache,
+// cmd/creation's storeAdapter) that predate that distinction.
 func (r *Repository) Get(ctx context.Context, shortKey string) (destination string, ok bool, err error) {
 	out, err := r.client.GetItem(ctx, &dynamodb.GetItemInput{
 		TableName: aws.String(r.mappingTable),
@@ -215,6 +219,39 @@ func (r *Repository) Get(ctx context.Context, shortKey string) (destination stri
 		return "", false, fmt.Errorf("unmarshal mapping: %w", err)
 	}
 	return m.Destination, true, nil
+}
+
+// MappingRecord is a stored mapping's full state relevant to
+// resolution (T8-02) — unlike Get, GetWithStatus does not silently
+// drop the status field.
+type MappingRecord struct {
+	Destination string `dynamodbav:"destination"`
+	Status      string `dynamodbav:"status"`
+}
+
+// GetWithStatus returns the stored mapping's destination and status
+// for a short key, or found=false if no mapping exists. This is the
+// repository-only read T8-02's resolver depends on: it makes no
+// assumption about status meaning "safe to redirect" — that
+// determination belongs to the caller (BR-007: a suspended mapping
+// must never redirect, and this method's own job is only to report
+// what's actually stored, not to interpret it).
+func (r *Repository) GetWithStatus(ctx context.Context, shortKey string) (MappingRecord, bool, error) {
+	out, err := r.client.GetItem(ctx, &dynamodb.GetItemInput{
+		TableName: aws.String(r.mappingTable),
+		Key:       map[string]types.AttributeValue{"pk": &types.AttributeValueMemberS{Value: shortKey}},
+	})
+	if err != nil {
+		return MappingRecord{}, false, fmt.Errorf("get mapping: %w", err)
+	}
+	if out.Item == nil {
+		return MappingRecord{}, false, nil
+	}
+	var m MappingRecord
+	if err := attributevalue.UnmarshalMap(out.Item, &m); err != nil {
+		return MappingRecord{}, false, fmt.Errorf("unmarshal mapping: %w", err)
+	}
+	return m, true, nil
 }
 
 // Reconcile scans both tables and reports Destination Claims that point to
