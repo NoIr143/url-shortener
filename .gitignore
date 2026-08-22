@@ -1,0 +1,19 @@
+# SDLC/planning documentation and process instructions — kept locally,
+# not part of the public product-code repository.
+/docs/
+/AGENTS.md
+/CLAUDE.md
+
+# Go build artifacts
+/bin/
+*.exe
+*.test
+*.out
+
+# OS/editor cruft
+.DS_Store
+.idea/
+.vscode/
+
+# Scratch/tmp
+/tmp/

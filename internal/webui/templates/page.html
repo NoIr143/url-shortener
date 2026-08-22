@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Shorten a URL — short.example</title>
+<style>
+  :root {
+    --bg: #FFFFFF; --surface: #F8FAFC; --surface-muted: #F1F5F9;
+    --fg: #0F172A; --fg-muted: #475569;
+    --border-subtle: #E2E8F0; --border-interactive: #64748B; --ring: #0F172A;
+    --accent: #15803D; --on-accent: #FFFFFF;
+    --danger: #B91C1C; --on-danger: #FFFFFF;
+    --warn: #B45309; --info: #0369A1;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #020617; --surface: #0E1223; --surface-muted: #1A1E2F;
+      --fg: #F8FAFC; --fg-muted: #94A3B8;
+      --border-subtle: #334155; --border-interactive: #64748B; --ring: #FFFFFF;
+      --accent: #22C55E; --on-accent: #020617;
+      --danger: #F87171; --on-danger: #020617;
+      --warn: #FCD34D; --info: #38BDF8;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font-family: -apple-system, "IBM Plex Sans", system-ui, sans-serif;
+    font-size: 16px; line-height: 1.6;
+  }
+  main { max-width: 34rem; margin: 3rem auto; padding: 0 1.5rem; }
+  h1 { font-size: 32px; line-height: 1.25; font-weight: 600; margin: 0 0 0.5rem; }
+  h2 { font-size: 24px; line-height: 1.3; font-weight: 600; margin: 0 0 1rem; }
+  p.lede { max-width: 65ch; color: var(--fg-muted); margin: 0 0 2rem; }
+  label { display: block; font-size: 14px; font-weight: 500; margin-bottom: 0.5rem; }
+  input[type=url] {
+    width: 100%; min-height: 44px; padding: 12px 16px; font-size: 16px;
+    background: var(--surface); color: var(--fg);
+    border: 1px solid var(--border-interactive); border-radius: 4px;
+  }
+  input[type=url]:focus { outline: 3px solid var(--ring); outline-offset: 1px; }
+  .helper { font-size: 14px; color: var(--fg-muted); margin-top: 0.5rem; }
+  .error-text { font-size: 14px; color: var(--danger); margin-top: 0.5rem; }
+  .error-summary {
+    border: 1px solid var(--danger); border-left-width: 3px; border-radius: 4px;
+    background: var(--surface); padding: 1rem; margin-bottom: 1.5rem;
+  }
+  .error-summary h2 { font-size: 16px; color: var(--danger); margin: 0 0 0.5rem; }
+  button {
+    min-height: 44px; padding: 12px 24px; font-size: 16px; font-weight: 600;
+    border-radius: 4px; cursor: pointer; margin-top: 1.5rem; border: none;
+  }
+  button.primary { background: var(--accent); color: var(--on-accent); }
+  button.secondary { background: transparent; color: var(--fg); border: 2px solid var(--fg); }
+  button:focus { outline: 3px solid var(--ring); outline-offset: 1px; }
+  .result-box {
+    display: flex; align-items: center; gap: 0.75rem; padding: 1rem;
+    background: var(--surface); border: 1px solid var(--border-subtle); border-radius: 8px;
+  }
+  .result-box code {
+    font-family: "JetBrains Mono", ui-monospace, monospace; font-size: 15px;
+    flex: 1; overflow-wrap: anywhere; user-select: all;
+  }
+  .status-region { margin-top: 0.75rem; font-size: 14px; }
+  .status-region.success { color: var(--accent); }
+  .status-region.info { color: var(--info); }
+  .banner-throttle { color: var(--warn); border-left: 3px dotted var(--warn); padding-left: 0.75rem; margin-bottom: 1rem; }
+  .banner-temp { color: var(--info); border-left: 3px dotted var(--info); padding-left: 0.75rem; margin-bottom: 1rem; }
+  a.skip-link {
+    position: absolute; left: -999px; top: 0; background: var(--accent); color: var(--on-accent);
+    padding: 0.5rem 1rem; z-index: 10;
+  }
+  a.skip-link:focus { left: 0.5rem; top: 0.5rem; }
+</style>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<main id="main">
+  <p style="font-size:14px;color:var(--fg-muted);margin:0 0 1.5rem;">short.example</p>
+
+  {{if eq .State "validation_error"}}
+    <div class="error-summary" role="alert" tabindex="-1" id="error-summary">
+      <h2>{{len .Errors}} problem found</h2>
+      <ul style="margin:0;padding-left:1.25rem;">
+        {{range .Errors}}<li>{{.}}</li>{{end}}
+      </ul>
+    </div>
+  {{end}}
+
+  {{if eq .State "throttled"}}
+    <p class="banner-throttle" role="status">Too many requests. Try again in {{.RetryAfter}}.</p>
+  {{end}}
+
+  {{if eq .State "temporary_failure"}}
+    <p class="banner-temp" role="status">We couldn't complete that just now. Your link was not created — try again.</p>
+  {{end}}
+
+  {{if or (eq .State "success_new") (eq .State "success_existing")}}
+    <h2 tabindex="-1" id="result-heading">Your short URL</h2>
+    <div class="result-box">
+      <code id="short-url">{{.ShortURL}}</code>
+      <button type="button" class="secondary" id="copy-btn" data-copy-target="short-url" style="margin-top:0;display:none;">Copy</button>
+    </div>
+    <p class="status-region" role="status" id="copy-status"></p>
+    {{if eq .State "success_existing"}}
+      <p class="helper">This URL was already shortened before — reusing the existing link.</p>
+    {{end}}
+    <form method="get" action="/">
+      <button type="submit" class="secondary">Shorten another URL</button>
+    </form>
+  {{else}}
+    <h1>Shorten a URL</h1>
+    <p class="lede">Paste an http or https address and get a short link you can share.</p>
+    <form method="post" action="/" id="create-form" aria-busy="false">
+      <label for="destination">Destination URL</label>
+      <input type="url" id="destination" name="destination" required
+             value="{{.Destination}}"
+             aria-describedby="destination-help{{if eq .State "validation_error"}} destination-error{{end}}">
+      <p class="helper" id="destination-help">Must start with http:// or https://.</p>
+      {{if eq .State "validation_error"}}<p class="error-text" id="destination-error">{{index .Errors 0}}</p>{{end}}
+      <button type="submit" class="primary">Shorten URL</button>
+    </form>
+  {{end}}
+</main>
+<script nonce="{{.Nonce}}">
+(function () {
+  "use strict";
+  var copyBtn = document.getElementById("copy-btn");
+  if (copyBtn && navigator.clipboard) {
+    copyBtn.style.display = "inline-block";
+    copyBtn.addEventListener("click", function () {
+      var text = document.getElementById("short-url").textContent;
+      navigator.clipboard.writeText(text).then(function () {
+        var s = document.getElementById("copy-status");
+        s.textContent = "Copied to clipboard";
+        s.className = "status-region success";
+      }, function () {
+        var s = document.getElementById("copy-status");
+        s.textContent = "Couldn't copy automatically — the link above is selected, copy it manually.";
+        s.className = "status-region info";
+        var r = document.getElementById("short-url");
+        var range = document.createRange();
+        range.selectNodeContents(r);
+        var sel = window.getSelection();
+        sel.removeAllRanges();
+        sel.addRange(range);
+      });
+    });
+  }
+  var form = document.getElementById("create-form");
+  if (form) {
+    var submitting = false;
+    form.addEventListener("submit", function (e) {
+      if (submitting) { e.preventDefault(); return; }
+      submitting = true;
+      form.setAttribute("aria-busy", "true");
+      var btn = form.querySelector("button[type=submit]");
+      btn.disabled = true;
+      btn.textContent = "Shortening…";
+    });
+  }
+  var heading = document.getElementById("result-heading") || document.getElementById("error-summary");
+  if (heading) { heading.focus(); }
+})();
+</script>
+</body>
+</html>
