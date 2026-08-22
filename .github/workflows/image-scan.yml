@@ -1,0 +1,45 @@
+name: image-scan
+
+# Builds each deployment-unit image (ARC-002/ARC-003/ARC-004/ARC-009) and
+# fails the build on any CRITICAL/HIGH vulnerability finding (NFR-SEC-004).
+# Mirrors the exact scan invocation already verified locally against these
+# four images (docs/poc/T5-04-images-ecr.md): `--scanners vuln --severity
+# CRITICAL,HIGH`. No AWS/ECR access here — this gates the image build
+# itself, before any push.
+
+on:
+  pull_request:
+    paths:
+      - "Dockerfile"
+      - ".dockerignore"
+      - "go.mod"
+      - "go.sum"
+      - "cmd/**"
+      - "internal/**"
+      - ".github/workflows/image-scan.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        unit: [creation, redirect, admin, worker]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        run: |
+          docker build --build-arg CMD_PATH=cmd/${{ matrix.unit }} \
+            -t url-shortener-${{ matrix.unit }}:ci .
+
+      - name: Scan with Trivy (fails on CRITICAL/HIGH)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: url-shortener-${{ matrix.unit }}:ci
+          scanners: vuln
+          severity: CRITICAL,HIGH
+          exit-code: "1"
