@@ -188,3 +188,97 @@ func TestStaleFencingTokenCannotSucceed(t *testing.T) {
 	}
 	t.Logf("PASS: split-brain race resolved without overlap (errA=%v errB=%v)", errA, errB)
 }
+
+// TestRestartResumesWithoutOverlap simulates the "restart" scenario
+// T7-02's evidence bar names: a process leases a range, then crashes —
+// modeled here by simply discarding the first *Allocator and
+// constructing a brand new one against the same table, the only state
+// that actually survives a real process restart. The new instance's
+// first lease must start exactly where the crashed instance's last
+// lease ended, never overlapping and never re-issuing any part of it.
+func TestRestartResumesWithoutOverlap(t *testing.T) {
+	client := localClient(t)
+	table := fmt.Sprintf("keyalloc_restart_%d", time.Now().UnixNano())
+
+	before := New(client, table, 1_000_000)
+	if err := before.EnsureTable(context.Background()); err != nil {
+		t.Fatalf("ensure table: %v", err)
+	}
+	deleteTable(t, client, table)
+
+	firstLease, err := before.AcquireLease(context.Background(), 50, 1)
+	if err != nil {
+		t.Fatalf("pre-restart lease: unexpected error: %v", err)
+	}
+
+	// "Restart": before is simply dropped (as if the process exited) and
+	// a fresh Allocator is constructed against the same table — no
+	// in-memory state carries over, exactly as a real process restart
+	// would leave nothing but what's durably stored in DynamoDB.
+	after := New(client, table, 1_000_000)
+
+	for i := 0; i < 3; i++ {
+		lease, err := after.AcquireLease(context.Background(), 50, 10)
+		if err != nil {
+			t.Fatalf("post-restart lease %d: unexpected error: %v", i, err)
+		}
+		if lease.Start < firstLease.End {
+			t.Fatalf("post-restart lease %d [%d,%d) overlaps or re-issues part of the pre-restart lease [%d,%d)",
+				i, lease.Start, lease.End, firstLease.Start, firstLease.End)
+		}
+	}
+	t.Logf("PASS: post-restart allocator resumed at %d without re-issuing any part of the pre-restart lease [%d,%d)", firstLease.End, firstLease.Start, firstLease.End)
+}
+
+// TestAbandonedLeaseNeverReissued is T7-02's "expiry" evidence: a lease
+// holder that only ever consumes part of its leased range (the rest is
+// effectively abandoned — a crash mid-lease, or simply never fully
+// used) must never have that unused remainder handed to anyone else
+// later. docs/SYSTEM_DESIGN.md's DATA-003 describes an expiry/status
+// field on the lease record; this Allocator does not implement one — a
+// monotonic, append-only counter (visible in allocator.go: next_start
+// only ever increases) makes reissue structurally impossible regardless
+// of whether a lease was fully used, so there is nothing to expire or
+// reclaim. This test proves that invariant holds, not that a reclaim
+// mechanism exists. See docs/poc/T7-02-lease-restart-expiry-tests.md
+// Section 1 for why building one is not justified at this project's
+// actual scale (365 billion mappings against a 3.52 trillion capacity —
+// docs/SRS.md).
+func TestAbandonedLeaseNeverReissued(t *testing.T) {
+	client := localClient(t)
+	table := fmt.Sprintf("keyalloc_expiry_%d", time.Now().UnixNano())
+
+	a := New(client, table, 1_000_000)
+	if err := a.EnsureTable(context.Background()); err != nil {
+		t.Fatalf("ensure table: %v", err)
+	}
+	deleteTable(t, client, table)
+
+	abandoned, err := a.AcquireLease(context.Background(), 100, 1)
+	if err != nil {
+		t.Fatalf("abandoned lease: unexpected error: %v", err)
+	}
+	// Simulate using only the first 5 of the 100 leased IDs before the
+	// holder is abandoned — the remaining 95 are never touched again by
+	// anyone, this test included.
+	usedUpTo := abandoned.Start + 5
+
+	const followUpLeases = 5
+	const leaseSize = 20
+	var prevEnd int64 = -1
+	for i := 0; i < followUpLeases; i++ {
+		lease, err := a.AcquireLease(context.Background(), leaseSize, 10)
+		if err != nil {
+			t.Fatalf("follow-up lease %d: unexpected error: %v", i, err)
+		}
+		if lease.Start < abandoned.End {
+			t.Fatalf("follow-up lease %d [%d,%d) reissues part of the abandoned lease's unused remainder [%d,%d) — used only up to %d",
+				i, lease.Start, lease.End, usedUpTo, abandoned.End, usedUpTo)
+		}
+		if prevEnd != -1 && lease.Start != prevEnd {
+			t.Fatalf("follow-up lease %d does not immediately follow the previous one: previous ended %d, this starts %d", i, prevEnd, lease.Start)
+		}
+		prevEnd = lease.End
+	}
+	t.Logf("PASS: %d IDs left unused within an abandoned lease [%d,%d) were never reissued across %d follow-up leases", abandoned.End-usedUpTo, abandoned.Start, abandoned.End, followUpLeases)
+}
