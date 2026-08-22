@@ -59,7 +59,11 @@ func ValidateDestination(raw string) error {
 
 // ErrInvalidShortKey is returned for a syntactically invalid key (FR-013).
 // Kept as this package's own sentinel for the same reason as the
-// destination errors above.
+// destination errors above, even though nothing outside this package
+// currently branches on its specific identity (unlike the destination
+// errors, ResolveHandler only ever checks err != nil) — kept for
+// consistency and so a future caller could start relying on it without
+// this package's public error taxonomy changing shape again.
 var ErrInvalidShortKey = errors.New("short key is not syntactically valid")
 
 // ValidateShortKey enforces the confirmed alphabet and length bound —
