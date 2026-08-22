@@ -66,7 +66,8 @@ func main() {
 	createLimiter := api.NewIPRateLimiter(10, time.Minute)
 	resolveLimiter := api.NewIPRateLimiter(100, time.Minute)
 
-	apiHandlers := api.NewHandlers(store, keyGen, createLimiter, resolveLimiter)
+	createHandler := api.NewCreateHandler(store, keyGen, createLimiter)
+	resolveHandler := api.NewResolveHandler(store, resolveLimiter)
 	uiHandler := webui.New(store, keyGen, createLimiter)
 
 	mux := http.NewServeMux()
@@ -76,12 +77,12 @@ func main() {
 
 	// JSON API (docs/decisions/DEC-009.md), sharing the same store/use case
 	// as the UI per IR-UI-001.
-	mux.HandleFunc("POST /api/v1/urls", apiHandlers.Create)
+	mux.HandleFunc("POST /api/v1/urls", createHandler.Create)
 
 	// Redirect resolution (docs/ACCEPTANCE_CRITERIA.md Part B.1). Registered
 	// last/most-general so it does not shadow "/" or "/api/v1/urls".
 	mux.HandleFunc("GET /{shortKey}", func(w http.ResponseWriter, r *http.Request) {
-		apiHandlers.Resolve(w, r, r.PathValue("shortKey"))
+		resolveHandler.Resolve(w, r, r.PathValue("shortKey"))
 	})
 
 	addr := ":8080"
