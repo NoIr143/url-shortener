@@ -67,9 +67,9 @@ func deleteTable(t *testing.T, client *dynamodb.Client, table string) {
 
 // mappingRepositoryAdapter satisfies application.MappingRepository over
 // a real *mapping.Repository, translating its raw-string API to domain
-// types and its ErrDigestCollision into application.ErrConflict at
-// exactly this boundary — the use case itself never imports
-// internal/mapping.
+// types and its ErrDigestCollision/ErrKeyCollision into
+// ErrConflict/ErrKeyCollision (T7-03) at exactly this boundary — the
+// use case itself never imports internal/mapping.
 type mappingRepositoryAdapter struct {
 	repo *mapping.Repository
 }
@@ -77,10 +77,14 @@ type mappingRepositoryAdapter struct {
 func (a mappingRepositoryAdapter) Create(ctx context.Context, shortKey domain.ShortKey, destination domain.Destination) (domain.ShortKey, bool, error) {
 	result, err := a.repo.Create(ctx, shortKey.String(), destination.String())
 	if err != nil {
-		if errors.Is(err, mapping.ErrDigestCollision) {
+		switch {
+		case errors.Is(err, mapping.ErrDigestCollision):
 			return domain.ShortKey{}, false, ErrConflict
+		case errors.Is(err, mapping.ErrKeyCollision):
+			return domain.ShortKey{}, false, ErrKeyCollision
+		default:
+			return domain.ShortKey{}, false, err
 		}
-		return domain.ShortKey{}, false, err
 	}
 	committed, err := domain.NewShortKey(result.ShortKey)
 	if err != nil {

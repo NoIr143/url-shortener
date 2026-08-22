@@ -33,6 +33,20 @@ var ErrDestinationTooLong = errors.New("mapping: destination exceeds 2048 charac
 // unresolvable outcome from a generic dependency failure.
 var ErrDigestCollision = errors.New("mapping: digest collision with non-equal destination")
 
+// ErrKeyCollision is returned by Create when the *mapping* table's own
+// attribute_not_exists(pk) condition is the one that failed — a
+// short key that already names a different mapping (BR-003: "a short
+// key identifies at most one destination mapping at a time"). The
+// leased-range allocator (docs/decisions/DEC-012.md, POC-001) is
+// supposed to make this impossible; reaching it means something has
+// gone wrong upstream of this repository (a corrupted counter, an
+// out-of-band write, a bug), not a routine outcome like an exact
+// repeat. A sentinel, distinct from ErrDigestCollision, so a caller can
+// tell "this specific key is taken — a fresh key would resolve it"
+// apart from "this destination already has a different key — no key
+// change would help" (T7-03).
+var ErrKeyCollision = errors.New("mapping: short key already maps to a different destination")
+
 const maxDestinationLength = 2048
 
 // Repository stores Mappings and Destination Claims in two DynamoDB
@@ -137,6 +151,22 @@ func (r *Repository) Create(ctx context.Context, shortKey, destination string) (
 
 	var txCanceled *types.TransactionCanceledException
 	if errors.As(err, &txCanceled) {
+		// T7-03: distinguish *which* condition actually failed via
+		// TransactWriteItems' per-item CancellationReasons (index 1 is
+		// the mapping-table Put below) rather than assuming — as before
+		// this task — that the claim table is always the cause. A
+		// mapping-table collision is checked first and takes priority:
+		// it is the more serious, less-expected outcome (BR-003), and
+		// must never be misdiagnosed as a routine exact-repeat by
+		// blindly looking up a claim that has nothing to do with why
+		// the transaction actually failed.
+		if len(txCanceled.CancellationReasons) > 1 {
+			reason := txCanceled.CancellationReasons[1]
+			if reason.Code != nil && *reason.Code == "ConditionalCheckFailed" {
+				return CreateResult{}, ErrKeyCollision
+			}
+		}
+
 		// The claim-table condition is the one expected to fail on an
 		// exact repeat; look up the winning mapping and verify full byte
 		// equality before trusting the digest (ADR-007: never assume a

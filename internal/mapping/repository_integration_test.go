@@ -11,6 +11,7 @@ package mapping
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"sync"
@@ -151,6 +152,51 @@ func TestByteEquivalenceNotSemanticEquivalence(t *testing.T) {
 	if !res1.Created || !res2.Created {
 		t.Fatalf("expected trailing-slash variant to be treated as a distinct destination, got res1=%+v res2=%+v", res1, res2)
 	}
+}
+
+// TestForcedKeyCollisionRejectedSafely is T7-03's evidence: a genuine
+// short-key collision (the same shortKey, two different destinations —
+// something the leased-range allocator is supposed to make impossible,
+// but this repository must still fail closed on rather than trust that
+// promise blindly) must be rejected with ErrKeyCollision specifically,
+// not misdiagnosed as an exact-repeat (ErrDigestCollision's job), and
+// the original mapping must survive completely untouched — no partial
+// overwrite, no corruption, BR-003 preserved.
+func TestForcedKeyCollisionRejectedSafely(t *testing.T) {
+	r := freshRepo(t)
+	const key = "collide1"
+	const original = "https://example.com/original-owner-of-this-key"
+	const attacker = "https://example.com/a-completely-different-destination"
+
+	first, err := r.Create(context.Background(), key, original)
+	if err != nil {
+		t.Fatalf("establishing the original mapping: unexpected error: %v", err)
+	}
+	if !first.Created {
+		t.Fatalf("expected the first Create for a fresh key to report Created=true")
+	}
+
+	// Force the collision: same key, a destination with a different
+	// digest, so the claim-table condition passes (no digest conflict)
+	// and only the mapping-table condition can be the one that fails.
+	_, err = r.Create(context.Background(), key, attacker)
+	if !errors.Is(err, ErrKeyCollision) {
+		t.Fatalf("expected ErrKeyCollision for a forced key collision, got %v", err)
+	}
+
+	// The original mapping must be exactly as it was — no partial
+	// overwrite from the rejected attempt.
+	dest, ok, getErr := r.Get(context.Background(), key)
+	if getErr != nil {
+		t.Fatalf("re-reading the mapping after the rejected collision: %v", getErr)
+	}
+	if !ok {
+		t.Fatalf("expected the original mapping to still exist after the rejected collision")
+	}
+	if dest != original {
+		t.Fatalf("expected the original destination %q to survive untouched, got %q", original, dest)
+	}
+	t.Logf("PASS: forced key collision on %q rejected with ErrKeyCollision; original mapping to %q survived untouched", key, original)
 }
 
 // TestReconciliationFindsNoOrphans is the local substitute for

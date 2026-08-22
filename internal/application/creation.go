@@ -37,6 +37,23 @@ var ErrUnavailable = errors.New("application: dependency unavailable")
 // error at all: Result.Created is false, but err is nil.
 var ErrConflict = errors.New("application: could not safely commit")
 
+// ErrKeyCollision reports that the candidate short key the KeyGenerator
+// produced already names a different mapping (BR-003) — the intended
+// mapping for internal/mapping.ErrKeyCollision (T7-03). Unlike
+// ErrConflict, a key collision is specifically about the *key*, not the
+// destination — a freshly generated key is expected to resolve it, so
+// Create retries with one rather than failing on the first occurrence.
+var ErrKeyCollision = errors.New("application: candidate key already in use")
+
+// maxKeyCollisionRetries bounds Create's retry loop (T7-03's "safe
+// retry" half of "forced collision rejected with safe retry/failure").
+// The leased-range allocator is supposed to make a key collision
+// essentially impossible (docs/decisions/DEC-012.md, POC-001), so a
+// handful of retries is generous, not a sign this is expected to
+// happen routinely — exhausting them means something is genuinely
+// wrong upstream, not that the allocator is merely unlucky.
+const maxKeyCollisionRetries = 3
+
 // MappingRepository is the port this use case depends on.
 type MappingRepository interface {
 	// Create attempts to atomically commit shortKey -> destination.
@@ -78,18 +95,32 @@ func NewCreationUseCase(repo MappingRepository, keys KeyGenerator) *CreationUseC
 // Create obtains a candidate key and commits destination. Every error
 // return carries a zero Result (FR-008) — there is no path where a
 // ShortKey is returned alongside a non-nil error.
+//
+// T7-03: a key collision (ErrKeyCollision) retries with a freshly
+// generated candidate, up to maxKeyCollisionRetries times, since a new
+// key is expected to resolve it — unlike ErrConflict (a destination-
+// digest collision), where retrying with a different key would not
+// change anything and is not attempted.
 func (u *CreationUseCase) Create(ctx context.Context, destination domain.Destination) (Result, error) {
-	candidate, err := u.keys.Next()
-	if err != nil {
-		return Result{}, errors.Join(ErrUnavailable, err)
-	}
+	var lastErr error
+	for attempt := 0; attempt <= maxKeyCollisionRetries; attempt++ {
+		candidate, err := u.keys.Next()
+		if err != nil {
+			return Result{}, errors.Join(ErrUnavailable, err)
+		}
 
-	committed, created, err := u.repo.Create(ctx, candidate, destination)
-	if err != nil {
+		committed, created, err := u.repo.Create(ctx, candidate, destination)
+		if err == nil {
+			return Result{ShortKey: committed, Created: created}, nil
+		}
 		if errors.Is(err, ErrConflict) {
 			return Result{}, ErrConflict
 		}
+		if errors.Is(err, ErrKeyCollision) {
+			lastErr = err
+			continue
+		}
 		return Result{}, errors.Join(ErrUnavailable, err)
 	}
-	return Result{ShortKey: committed, Created: created}, nil
+	return Result{}, errors.Join(ErrUnavailable, lastErr)
 }
