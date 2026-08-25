@@ -430,22 +430,114 @@ func TestGetWithStatus_DistinguishesActiveFromSuspended(t *testing.T) {
 	t.Log("PASS: GetWithStatus correctly distinguished Active, Suspended, and unknown for real stored records")
 }
 
-// TestByteEquivalenceNotSemanticEquivalence proves DR-005: a
-// trailing-slash variant is a *different* destination under the confirmed
-// byte-equality rule (docs/decisions/DEC-006.md), so it gets its own
-// mapping rather than being silently merged.
+// TestByteEquivalenceNotSemanticEquivalence proves DR-005's stable equality
+// rule across a corpus: only byte-identical destinations deduplicate. Values
+// that a URL normalizer might consider equivalent remain distinct because
+// DEC-006 explicitly forbids silent canonicalization.
 func TestByteEquivalenceNotSemanticEquivalence(t *testing.T) {
 	r := freshRepo(t)
-	res1, err := r.Create(context.Background(), "keyC", "https://example.com/path")
+	const destination = "https://example.com/path?a=1&b=2"
+
+	first, err := r.Create(context.Background(), "equal01", destination)
 	if err != nil {
 		t.Fatal(err)
 	}
-	res2, err := r.Create(context.Background(), "keyD", "https://example.com/path/")
+	if !first.Created {
+		t.Fatal("expected the first byte sequence to create a mapping")
+	}
+
+	repeat, err := r.Create(context.Background(), "unused1", destination)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !res1.Created || !res2.Created {
-		t.Fatalf("expected trailing-slash variant to be treated as a distinct destination, got res1=%+v res2=%+v", res1, res2)
+	if repeat.Created || repeat.ShortKey != first.ShortKey {
+		t.Fatalf("byte-identical repeat did not return the existing mapping: first=%+v repeat=%+v", first, repeat)
+	}
+
+	variants := []string{
+		"https://example.com/path/?a=1&b=2",
+		"https://EXAMPLE.com/path?a=1&b=2",
+		"https://example.com/%70ath?a=1&b=2",
+		"https://example.com/path?b=2&a=1",
+		"https://example.com/path?a=1&b=2#fragment",
+	}
+	for i, variant := range variants {
+		result, err := r.Create(context.Background(), fmt.Sprintf("diff%02d", i), variant)
+		if err != nil {
+			t.Fatalf("variant %d: %v", i, err)
+		}
+		if !result.Created {
+			t.Fatalf("variant %d was silently canonicalized: %q", i, variant)
+		}
+	}
+}
+
+// TestDigestCollisionFailsClosedWithoutPartialMapping is T9-03's required
+// collision simulation. A claim is deliberately placed under another
+// destination's digest, representing either a cryptographic collision or
+// corrupted data. Create must verify the stored destination's full bytes,
+// return ErrDigestCollision, and leave both tables unchanged.
+func TestDigestCollisionFailsClosedWithoutPartialMapping(t *testing.T) {
+	r := freshRepo(t)
+	const (
+		originalKey          = "owner01"
+		candidateKey         = "newkey1"
+		storedDestination    = "https://example.com/original-claim-owner"
+		candidateDestination = "https://example.com/candidate-with-forced-digest-collision"
+	)
+
+	if _, err := r.Create(context.Background(), originalKey, storedDestination); err != nil {
+		t.Fatalf("create original mapping: %v", err)
+	}
+
+	forcedClaim := map[string]types.AttributeValue{
+		"pk":          &types.AttributeValueMemberS{Value: digestOf(candidateDestination)},
+		"short_key":   &types.AttributeValueMemberS{Value: originalKey},
+		"destination": &types.AttributeValueMemberS{Value: storedDestination},
+	}
+	if _, err := r.client.PutItem(context.Background(), &dynamodb.PutItemInput{
+		TableName: aws.String(r.claimTable),
+		Item:      forcedClaim,
+	}); err != nil {
+		t.Fatalf("seed forced digest collision: %v", err)
+	}
+
+	_, err := r.Create(context.Background(), candidateKey, candidateDestination)
+	if !errors.Is(err, ErrDigestCollision) {
+		t.Fatalf("expected ErrDigestCollision, got %v", err)
+	}
+
+	candidate, err := r.client.GetItem(context.Background(), &dynamodb.GetItemInput{
+		TableName:      aws.String(r.mappingTable),
+		Key:            map[string]types.AttributeValue{"pk": &types.AttributeValueMemberS{Value: candidateKey}},
+		ConsistentRead: aws.Bool(true),
+	})
+	if err != nil {
+		t.Fatalf("read rejected candidate mapping: %v", err)
+	}
+	if candidate.Item != nil {
+		t.Fatalf("digest collision left a partial mapping: %#v", candidate.Item)
+	}
+
+	claim, err := r.client.GetItem(context.Background(), &dynamodb.GetItemInput{
+		TableName:      aws.String(r.claimTable),
+		Key:            map[string]types.AttributeValue{"pk": &types.AttributeValueMemberS{Value: digestOf(candidateDestination)}},
+		ConsistentRead: aws.Bool(true),
+	})
+	if err != nil {
+		t.Fatalf("read forced collision claim: %v", err)
+	}
+	claimDestination, ok := claim.Item["destination"].(*types.AttributeValueMemberS)
+	if !ok || claimDestination.Value != storedDestination {
+		t.Fatalf("forced claim was altered after rejection: %#v", claim.Item)
+	}
+
+	original, found, err := r.Get(context.Background(), originalKey)
+	if err != nil {
+		t.Fatalf("read original mapping: %v", err)
+	}
+	if !found || original != storedDestination {
+		t.Fatalf("original mapping changed: found=%v destination=%q", found, original)
 	}
 }
 
