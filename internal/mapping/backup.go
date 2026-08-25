@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue"
@@ -11,13 +12,16 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 )
 
-// snapshotRecord is a backup-format row for either table; only one of the
-// two payload fields is populated depending on Kind.
+// snapshotRecord is a backup-format row for either table. Mapping-only state
+// is retained exactly so restore cannot silently reset lifecycle metadata.
 type snapshotRecord struct {
 	Kind        string `json:"kind"` // "mapping" or "claim"
 	ShortKey    string `json:"shortKey,omitempty"`
 	Destination string `json:"destination,omitempty"`
 	Digest      string `json:"digest,omitempty"`
+	Status      string `json:"status,omitempty"`
+	Version     int64  `json:"version,omitempty"`
+	CreatedAt   string `json:"createdAt,omitempty"`
 }
 
 // Backup exports every Mapping and Destination Claim item as a JSON
@@ -37,11 +41,21 @@ func (r *Repository) Backup(ctx context.Context) ([]byte, error) {
 		var m struct {
 			PK          string `dynamodbav:"pk"`
 			Destination string `dynamodbav:"destination"`
+			Status      string `dynamodbav:"status"`
+			Version     int64  `dynamodbav:"version"`
+			CreatedAt   string `dynamodbav:"created_at"`
 		}
 		if err := attributevalue.UnmarshalMap(item, &m); err != nil {
 			return nil, fmt.Errorf("unmarshal mapping for backup: %w", err)
 		}
-		records = append(records, snapshotRecord{Kind: "mapping", ShortKey: m.PK, Destination: m.Destination})
+		records = append(records, snapshotRecord{
+			Kind:        "mapping",
+			ShortKey:    m.PK,
+			Destination: m.Destination,
+			Status:      m.Status,
+			Version:     m.Version,
+			CreatedAt:   m.CreatedAt,
+		})
 	}
 
 	claims, err := r.client.Scan(ctx, &dynamodb.ScanInput{TableName: aws.String(r.claimTable)})
@@ -76,12 +90,30 @@ func (r *Repository) Restore(ctx context.Context, snapshot []byte) error {
 	for _, rec := range records {
 		switch rec.Kind {
 		case "mapping":
+			if rec.Status == "" || rec.Version < 1 || rec.CreatedAt == "" {
+				return fmt.Errorf("restore mapping %s: snapshot is missing lifecycle metadata", rec.ShortKey)
+			}
+			createdAt, err := time.Parse(time.RFC3339Nano, rec.CreatedAt)
+			if err != nil {
+				return fmt.Errorf("restore mapping %s: invalid createdAt: %w", rec.ShortKey, err)
+			}
+			_, offset := createdAt.Zone()
+			if offset != 0 {
+				return fmt.Errorf("restore mapping %s: createdAt must be UTC", rec.ShortKey)
+			}
 			item, err := attributevalue.MarshalMap(struct {
 				PK          string `dynamodbav:"pk"`
 				Destination string `dynamodbav:"destination"`
 				Status      string `dynamodbav:"status"`
 				Version     int64  `dynamodbav:"version"`
-			}{PK: rec.ShortKey, Destination: rec.Destination, Status: "Active", Version: 1})
+				CreatedAt   string `dynamodbav:"created_at"`
+			}{
+				PK:          rec.ShortKey,
+				Destination: rec.Destination,
+				Status:      rec.Status,
+				Version:     rec.Version,
+				CreatedAt:   rec.CreatedAt,
+			})
 			if err != nil {
 				return fmt.Errorf("marshal restored mapping %s: %w", rec.ShortKey, err)
 			}

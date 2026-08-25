@@ -137,6 +137,68 @@ func TestDistinctDestinationsGetDistinctMappings(t *testing.T) {
 	}
 }
 
+// TestCreationMetadataIsAtomicAndImmutable proves DR-003/DR-004 at the
+// repository boundary: lifecycle metadata is committed with the mapping,
+// uses a precise UTC representation, and is not rewritten by an exact repeat
+// or a rejected short-key collision.
+func TestCreationMetadataIsAtomicAndImmutable(t *testing.T) {
+	r := freshRepo(t)
+	createdAt := time.Date(2026, time.August, 25, 9, 10, 11, 123456789, time.FixedZone("test", 7*60*60))
+	r.now = func() time.Time { return createdAt }
+
+	const (
+		key         = "metaA1"
+		destination = "https://example.com/creation-metadata"
+	)
+	created, err := r.Create(context.Background(), key, destination)
+	if err != nil {
+		t.Fatalf("create mapping: %v", err)
+	}
+	if !created.Created || created.ShortKey != key {
+		t.Fatalf("unexpected create result: %+v", created)
+	}
+
+	wantCreatedAt := createdAt.UTC().Format(time.RFC3339Nano)
+	assertMetadata := func(stage string) {
+		t.Helper()
+		record, found, err := r.GetWithStatus(context.Background(), key)
+		if err != nil {
+			t.Fatalf("%s: get mapping: %v", stage, err)
+		}
+		if !found {
+			t.Fatalf("%s: mapping missing", stage)
+		}
+		if record.Destination != destination || record.Status != "Active" || record.Version != 1 || record.CreatedAt != wantCreatedAt {
+			t.Fatalf("%s: unexpected mapping metadata: %+v; want destination=%q status=Active version=1 createdAt=%q",
+				stage, record, destination, wantCreatedAt)
+		}
+		parsed, err := time.Parse(time.RFC3339Nano, record.CreatedAt)
+		if err != nil {
+			t.Fatalf("%s: parse created_at: %v", stage, err)
+		}
+		if parsed.Location() != time.UTC {
+			t.Fatalf("%s: created_at is not UTC: %q", stage, record.CreatedAt)
+		}
+	}
+	assertMetadata("initial create")
+
+	r.now = func() time.Time { return createdAt.Add(24 * time.Hour) }
+	repeated, err := r.Create(context.Background(), "unused2", destination)
+	if err != nil {
+		t.Fatalf("exact repeat: %v", err)
+	}
+	if repeated.Created || repeated.ShortKey != key {
+		t.Fatalf("unexpected exact-repeat result: %+v", repeated)
+	}
+	assertMetadata("exact repeat")
+
+	_, err = r.Create(context.Background(), key, "https://example.com/different")
+	if !errors.Is(err, ErrKeyCollision) {
+		t.Fatalf("expected ErrKeyCollision, got %v", err)
+	}
+	assertMetadata("rejected key collision")
+}
+
 // TestConcurrentSameKeyDifferentDestinationsCommitsOneMapping is T9-02's
 // mapping-table concurrency proof. Destination-claim contention is covered by
 // TestConcurrentExactRepeatYieldsOneMapping; this test instead makes every
