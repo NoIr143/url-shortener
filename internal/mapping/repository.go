@@ -13,6 +13,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue"
@@ -55,10 +56,16 @@ type Repository struct {
 	client       *dynamodb.Client
 	mappingTable string
 	claimTable   string
+	now          func() time.Time
 }
 
 func New(client *dynamodb.Client, mappingTable, claimTable string) *Repository {
-	return &Repository{client: client, mappingTable: mappingTable, claimTable: claimTable}
+	return &Repository{
+		client:       client,
+		mappingTable: mappingTable,
+		claimTable:   claimTable,
+		now:          time.Now,
+	}
 }
 
 // EnsureTables creates both tables if they do not already exist. Test
@@ -107,13 +114,21 @@ func (r *Repository) Create(ctx context.Context, shortKey, destination string) (
 		return CreateResult{}, ErrDestinationTooLong
 	}
 	digest := digestOf(destination)
+	createdAt := r.now().UTC().Format(time.RFC3339Nano)
 
 	mappingItem, err := attributevalue.MarshalMap(struct {
 		PK          string `dynamodbav:"pk"`
 		Destination string `dynamodbav:"destination"`
 		Status      string `dynamodbav:"status"`
 		Version     int64  `dynamodbav:"version"`
-	}{PK: shortKey, Destination: destination, Status: "Active", Version: 1})
+		CreatedAt   string `dynamodbav:"created_at"`
+	}{
+		PK:          shortKey,
+		Destination: destination,
+		Status:      "Active",
+		Version:     1,
+		CreatedAt:   createdAt,
+	})
 	if err != nil {
 		return CreateResult{}, fmt.Errorf("marshal mapping: %w", err)
 	}
@@ -221,12 +236,14 @@ func (r *Repository) Get(ctx context.Context, shortKey string) (destination stri
 	return m.Destination, true, nil
 }
 
-// MappingRecord is a stored mapping's full state relevant to
-// resolution (T8-02) — unlike Get, GetWithStatus does not silently
-// drop the status field.
+// MappingRecord is a stored mapping's persisted state relevant to resolution,
+// lifecycle fencing, and creation-time audit decisions. Unlike Get,
+// GetWithStatus does not silently drop that metadata.
 type MappingRecord struct {
 	Destination string `dynamodbav:"destination"`
 	Status      string `dynamodbav:"status"`
+	Version     int64  `dynamodbav:"version"`
+	CreatedAt   string `dynamodbav:"created_at"`
 }
 
 // GetWithStatus returns the stored mapping's destination and status

@@ -22,6 +22,8 @@ func TestBackupRestoreReconcile(t *testing.T) {
 	suffix := time.Now().UnixNano()
 	srcMappingTable, srcClaimTable := fmt.Sprintf("backup_src_mapping_%d", suffix), fmt.Sprintf("backup_src_claim_%d", suffix)
 	src := New(client, srcMappingTable, srcClaimTable)
+	fixedCreatedAt := time.Date(2026, time.August, 25, 2, 3, 4, 567890123, time.UTC)
+	src.now = func() time.Time { return fixedCreatedAt }
 	if err := src.EnsureTables(context.Background()); err != nil {
 		t.Fatalf("ensure source tables: %v", err)
 	}
@@ -81,6 +83,16 @@ func TestBackupRestoreReconcile(t *testing.T) {
 		}
 		if gotDest != wantDest {
 			t.Fatalf("restored mapping %s: destination mismatch: got %q want %q", key, gotDest, wantDest)
+		}
+		record, found, err := dst.GetWithStatus(context.Background(), key)
+		if err != nil {
+			t.Fatalf("get restored metadata %s: %v", key, err)
+		}
+		if !found {
+			t.Fatalf("restored mapping metadata %s missing", key)
+		}
+		if record.Status != "Active" || record.Version != 1 || record.CreatedAt != fixedCreatedAt.Format(time.RFC3339Nano) {
+			t.Fatalf("restored mapping %s metadata mismatch: %+v", key, record)
 		}
 	}
 
