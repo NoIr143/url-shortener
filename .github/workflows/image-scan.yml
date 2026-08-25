@@ -37,7 +37,7 @@ jobs:
             -t url-shortener-${{ matrix.unit }}:ci .
 
       - name: Scan with Trivy (fails on CRITICAL/HIGH)
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: url-shortener-${{ matrix.unit }}:ci
           scanners: vuln

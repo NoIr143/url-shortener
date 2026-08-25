@@ -92,6 +92,11 @@ module "worker" {
   vpc_id     = module.vpc.vpc_id
   subnet_ids = module.vpc.private_subnet_ids
   image      = "${module.ecr["worker"].repository_url}:latest"
+  environment = [
+    { name = "OUTBOX_QUEUE_URL", value = aws_sqs_queue.outbox.url },
+    { name = "OUTBOX_TABLE", value = aws_dynamodb_table.outbox_event.name },
+    { name = "WORKER_CHECKPOINT_TABLE", value = aws_dynamodb_table.worker_checkpoint.name },
+  ]
 
   tags = module.tags.common_tags
 }

@@ -1,28 +1,70 @@
-// cmd/worker scaffolds the Outbox/Control Worker deployment unit
-// (ARC-009): "Publish committed mapping/lifecycle changes,
-// invalidate/update cache, persist derived audit/event evidence, retry
-// safely." It has no HTTP surface — it is a background consumer.
-//
-// This is a scaffold, not a working service: DynamoDB Streams ->
-// EventBridge Pipes -> SQS (ADR-014) has not been built, and ADR-005
-// (transactional outbox, idempotent consumers) remains Deferred per
-// docs/ADR_RECONCILIATION.md — no new evidence exists for either yet.
-// This command exists so the deployment boundary is real and
-// reviewable now, not implied by documentation alone.
+// cmd/worker is ARC-009's background SQS consumer. It has no HTTP surface.
 package main
 
 import (
+	"context"
 	"log"
-	"time"
+	"os"
+	"os/signal"
+	"syscall"
+
+	"url-shortener/internal/worker"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
+	"github.com/aws/aws-sdk-go-v2/service/sqs"
 )
 
 func main() {
-	log.Print("outbox/control worker scaffold starting (ARC-009) — no queue consumer implemented yet, see docs/ADR_RECONCILIATION.md (ADR-005/ADR-014: Deferred)")
-	// TODO(ADR-005/ADR-014): consume the outbox (DynamoDB Streams ->
-	// EventBridge Pipes -> SQS), invalidate the redirect cache
-	// (internal/cache.RedirectCache.Invalidate) on lifecycle changes, and
-	// persist audit evidence (DR-006). None of this exists yet.
-	for {
-		time.Sleep(time.Hour)
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	queueURL := os.Getenv("OUTBOX_QUEUE_URL")
+	if queueURL == "" {
+		log.Fatal("OUTBOX_QUEUE_URL is required")
 	}
+	cfg := awsConfig(ctx)
+	dynamo := dynamodb.NewFromConfig(cfg, func(options *dynamodb.Options) {
+		if endpoint := os.Getenv("DYNAMODB_ENDPOINT"); endpoint != "" {
+			options.BaseEndpoint = aws.String(endpoint)
+		}
+	})
+	queue := sqs.NewFromConfig(cfg, func(options *sqs.Options) {
+		if endpoint := os.Getenv("SQS_ENDPOINT"); endpoint != "" {
+			options.BaseEndpoint = aws.String(endpoint)
+		}
+	})
+
+	store := worker.NewDynamoDBStore(dynamo, envOr("WORKER_CHECKPOINT_TABLE", "worker_checkpoint"), envOr("OUTBOX_TABLE", "outbox_event"))
+	if os.Getenv("DYNAMODB_ENDPOINT") != "" {
+		if err := store.EnsureCheckpointTable(ctx); err != nil {
+			log.Fatalf("ensure local checkpoint table: %v", err)
+		}
+	}
+	runner := worker.NewRunner(queue, queueURL, worker.NewProcessor(store), log.Default())
+	log.Print("outbox/control worker started (ARC-009, INT-008)")
+	if err := runner.Run(ctx); err != nil {
+		log.Fatalf("worker stopped: %v", err)
+	}
+}
+
+func awsConfig(ctx context.Context) aws.Config {
+	options := []func(*awsconfig.LoadOptions) error{awsconfig.WithRegion(envOr("AWS_REGION", "us-east-1"))}
+	if os.Getenv("DYNAMODB_ENDPOINT") != "" || os.Getenv("SQS_ENDPOINT") != "" {
+		options = append(options, awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider("local", "local", "")))
+	}
+	cfg, err := awsconfig.LoadDefaultConfig(ctx, options...)
+	if err != nil {
+		log.Fatalf("load AWS config: %v", err)
+	}
+	return cfg
+}
+
+func envOr(name, fallback string) string {
+	if value := os.Getenv(name); value != "" {
+		return value
+	}
+	return fallback
 }

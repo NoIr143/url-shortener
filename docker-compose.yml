@@ -36,14 +36,12 @@ services:
       retries: 5
 
   # Broad local AWS service emulation (LocalStack Community — the free
-  # services, not the Pro-only ones) for whatever future work needs it:
-  # ADR-014's outbox path (EventBridge/SQS), a place to exercise the
-  # KMS keys and Secrets Manager secret T5-07 created, S3, etc. No
-  # application code talks to this yet — cmd/worker (ARC-009) is still
-  # an empty scaffold (ADR-005/ADR-014 Deferred), and nothing else in
-  # this repo has a use for S3/SQS/EventBridge/Secrets Manager/KMS.
-  # This is available ahead of that need, not proof anything consumes
-  # it today. Point a real AWS SDK client at it locally with
+  # services, not the Pro-only ones). T9-05's ready hook creates the
+  # worker queue and its DLQ; cmd/worker consumes that queue while its
+  # DynamoDB checkpoint/outbox records remain in dynamodb-local. The
+  # managed DynamoDB Streams -> EventBridge Pipes hop itself is IaC and
+  # real-AWS validation territory, not claimed by this local substitute.
+  # Point another AWS SDK client at LocalStack with
   # AWS_ENDPOINT_URL=http://localhost:4566 plus any non-empty
   # credentials (LocalStack does not check them).
   #
@@ -60,6 +58,8 @@ services:
     environment:
       - DEBUG=0
       - PERSISTENCE=0
+    volumes:
+      - ./infra/localstack/init-events.sh:/etc/localstack/init/ready.d/init-events.sh:ro
     healthcheck:
       test: ["CMD", "curl", "-s", "-f", "http://localhost:4566/_localstack/health"]
       interval: 5s
@@ -117,3 +117,12 @@ services:
       context: .
       args:
         CMD_PATH: cmd/worker
+    environment:
+      DYNAMODB_ENDPOINT: http://dynamodb-local:8000
+      SQS_ENDPOINT: http://localstack:4566
+      OUTBOX_QUEUE_URL: http://localstack:4566/000000000000/url-shortener-outbox
+    depends_on:
+      dynamodb-local:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy

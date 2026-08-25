@@ -83,3 +83,34 @@ resource "aws_iam_role_policy" "redirect_dynamodb" {
   role   = module.redirect.task_role_name
   policy = data.aws_iam_policy_document.redirect_dynamodb.json
 }
+
+data "aws_iam_policy_document" "worker_events" {
+  statement {
+    sid = "ConsumeOutboxQueue"
+    actions = [
+      "sqs:ReceiveMessage",
+      "sqs:DeleteMessage",
+    ]
+    resources = [aws_sqs_queue.outbox.arn]
+  }
+
+  statement {
+    sid = "VersionCheckpoint"
+    actions = [
+      "dynamodb:GetItem",
+      "dynamodb:PutItem",
+      "dynamodb:UpdateItem",
+      "dynamodb:TransactWriteItems",
+    ]
+    resources = [
+      aws_dynamodb_table.worker_checkpoint.arn,
+      aws_dynamodb_table.outbox_event.arn,
+    ]
+  }
+}
+
+resource "aws_iam_role_policy" "worker_events" {
+  name   = "event-worker-least-privilege"
+  role   = module.worker.task_role_name
+  policy = data.aws_iam_policy_document.worker_events.json
+}
