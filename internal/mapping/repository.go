@@ -187,8 +187,9 @@ func (r *Repository) Create(ctx context.Context, shortKey, destination string) (
 		// equality before trusting the digest (ADR-007: never assume a
 		// digest alone proves semantic equivalence).
 		existing, getErr := r.client.GetItem(ctx, &dynamodb.GetItemInput{
-			TableName: aws.String(r.claimTable),
-			Key:       map[string]types.AttributeValue{"pk": &types.AttributeValueMemberS{Value: digest}},
+			TableName:      aws.String(r.claimTable),
+			Key:            map[string]types.AttributeValue{"pk": &types.AttributeValueMemberS{Value: digest}},
+			ConsistentRead: aws.Bool(true),
 		})
 		if getErr != nil || existing.Item == nil {
 			return CreateResult{}, fmt.Errorf("transaction canceled and claim lookup failed: %w", err)
