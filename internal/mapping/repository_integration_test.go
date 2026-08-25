@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -133,6 +134,180 @@ func TestDistinctDestinationsGetDistinctMappings(t *testing.T) {
 	}
 	if !res1.Created || !res2.Created {
 		t.Fatalf("expected both distinct destinations to create new mappings: res1=%+v res2=%+v", res1, res2)
+	}
+}
+
+// TestConcurrentSameKeyDifferentDestinationsCommitsOneMapping is T9-02's
+// mapping-table concurrency proof. Destination-claim contention is covered by
+// TestConcurrentExactRepeatYieldsOneMapping; this test instead makes every
+// destination distinct while every writer races for the same short key. The
+// mapping condition must select one winner, reject every loser with
+// ErrKeyCollision, and leave no claim behind for a transaction that lost.
+func TestConcurrentSameKeyDifferentDestinationsCommitsOneMapping(t *testing.T) {
+	r := freshRepo(t)
+	const (
+		key        = "sameKey"
+		goroutines = 32
+	)
+
+	destinations := make([]string, goroutines)
+	results := make([]CreateResult, goroutines)
+	errs := make([]error, goroutines)
+	start := make(chan struct{})
+
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+	for i := 0; i < goroutines; i++ {
+		destinations[i] = fmt.Sprintf("https://example.com/concurrent-key-owner/%d", i)
+		go func(idx int) {
+			defer wg.Done()
+			<-start
+			results[idx], errs[idx] = r.Create(context.Background(), key, destinations[idx])
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	winner := -1
+	for i, err := range errs {
+		switch {
+		case err == nil:
+			if winner != -1 {
+				t.Fatalf("expected one successful writer, but writers %d and %d both succeeded", winner, i)
+			}
+			if !results[i].Created || results[i].ShortKey != key {
+				t.Fatalf("writer %d returned an invalid success result: %+v", i, results[i])
+			}
+			winner = i
+		case errors.Is(err, ErrKeyCollision):
+			// Expected for every writer that lost the mapping-table CAS.
+		default:
+			t.Fatalf("writer %d returned an unexpected error: %v", i, err)
+		}
+	}
+	if winner == -1 {
+		t.Fatal("expected exactly one successful writer, got none")
+	}
+
+	stored, err := r.client.GetItem(context.Background(), &dynamodb.GetItemInput{
+		TableName:      aws.String(r.mappingTable),
+		Key:            map[string]types.AttributeValue{"pk": &types.AttributeValueMemberS{Value: key}},
+		ConsistentRead: aws.Bool(true),
+	})
+	if err != nil {
+		t.Fatalf("strongly read winning mapping: %v", err)
+	}
+	storedDestination, ok := stored.Item["destination"].(*types.AttributeValueMemberS)
+	if !ok || storedDestination.Value != destinations[winner] {
+		t.Fatalf("expected winning destination %q, got item %#v", destinations[winner], stored.Item)
+	}
+
+	claimCount := 0
+	for i, destination := range destinations {
+		claim, err := r.client.GetItem(context.Background(), &dynamodb.GetItemInput{
+			TableName:      aws.String(r.claimTable),
+			Key:            map[string]types.AttributeValue{"pk": &types.AttributeValueMemberS{Value: digestOf(destination)}},
+			ConsistentRead: aws.Bool(true),
+		})
+		if err != nil {
+			t.Fatalf("strongly read claim %d: %v", i, err)
+		}
+		if claim.Item == nil {
+			continue
+		}
+		claimCount++
+		if i != winner {
+			t.Fatalf("losing writer %d left a partial destination claim", i)
+		}
+	}
+	if claimCount != 1 {
+		t.Fatalf("expected exactly one committed destination claim, got %d", claimCount)
+	}
+}
+
+// TestCaseSensitiveKeysRemainDistinct proves DR-001 at the DynamoDB boundary:
+// keys differing only by ASCII case remain separate partition-key values and
+// resolve to their own immutable destinations.
+func TestCaseSensitiveKeysRemainDistinct(t *testing.T) {
+	r := freshRepo(t)
+
+	for _, tc := range []struct {
+		key         string
+		destination string
+	}{
+		{key: "CaseA1", destination: "https://example.com/upper"},
+		{key: "caseA1", destination: "https://example.com/lower"},
+	} {
+		result, err := r.Create(context.Background(), tc.key, tc.destination)
+		if err != nil {
+			t.Fatalf("Create(%q): %v", tc.key, err)
+		}
+		if !result.Created || result.ShortKey != tc.key {
+			t.Fatalf("Create(%q) returned %+v", tc.key, result)
+		}
+	}
+
+	for _, tc := range []struct {
+		key         string
+		destination string
+	}{
+		{key: "CaseA1", destination: "https://example.com/upper"},
+		{key: "caseA1", destination: "https://example.com/lower"},
+	} {
+		destination, found, err := r.Get(context.Background(), tc.key)
+		if err != nil {
+			t.Fatalf("Get(%q): %v", tc.key, err)
+		}
+		if !found || destination != tc.destination {
+			t.Fatalf("Get(%q): found=%v destination=%q, want %q", tc.key, found, destination, tc.destination)
+		}
+	}
+}
+
+// TestDestinationBoundaryRoundTripsExactBytes proves DR-002 at the durable
+// repository boundary. The largest accepted destination is returned byte for
+// byte, while limit+1 is rejected before either table receives a partial item.
+func TestDestinationBoundaryRoundTripsExactBytes(t *testing.T) {
+	r := freshRepo(t)
+	const prefix = "https://example.com/"
+	atLimit := prefix + strings.Repeat("a", maxDestinationLength-len(prefix))
+
+	result, err := r.Create(context.Background(), "limit01", atLimit)
+	if err != nil {
+		t.Fatalf("Create(destination at limit): %v", err)
+	}
+	if !result.Created {
+		t.Fatal("expected destination at the limit to create a mapping")
+	}
+
+	got, found, err := r.Get(context.Background(), result.ShortKey)
+	if err != nil {
+		t.Fatalf("Get(destination at limit): %v", err)
+	}
+	if !found || got != atLimit {
+		t.Fatalf("destination round trip mismatch: found=%v got length=%d want length=%d", found, len(got), len(atLimit))
+	}
+
+	tooLong := atLimit + "b"
+	if _, err := r.Create(context.Background(), "limit02", tooLong); !errors.Is(err, ErrDestinationTooLong) {
+		t.Fatalf("Create(destination over limit): got %v, want ErrDestinationTooLong", err)
+	}
+
+	for table, key := range map[string]string{
+		r.mappingTable: "limit02",
+		r.claimTable:   digestOf(tooLong),
+	} {
+		out, err := r.client.GetItem(context.Background(), &dynamodb.GetItemInput{
+			TableName:      aws.String(table),
+			Key:            map[string]types.AttributeValue{"pk": &types.AttributeValueMemberS{Value: key}},
+			ConsistentRead: aws.Bool(true),
+		})
+		if err != nil {
+			t.Fatalf("read %s after rejected destination: %v", table, err)
+		}
+		if out.Item != nil {
+			t.Fatalf("rejected destination left an item in %s: %#v", table, out.Item)
+		}
 	}
 }
 
