@@ -1,10 +1,9 @@
 // resolve.go implements the redirect resolution use case (T8-02;
-// FR-009 to FR-016/021): a repository-only resolver, deliberately
-// without any cache layer — Valkey status-aware cache-aside is T9-06's
-// separate, later task, added on top of this one, not built here.
+// FR-009 to FR-016/021). Its MappingReader port can be backed directly by a
+// repository or by T9-06's status-aware cache-aside adapter.
 //
-// "Repository-only" and "safe status outcomes" together mean this use
-// case reports exactly one of a closed set of outcomes for every
+// The narrow reader port and safe status outcomes together mean this use case
+// reports exactly one of a closed set of outcomes for every
 // input, with no path that could expose a suspended mapping's
 // destination or redirect on an ambiguous/unrecognized state
 // (BR-007/NFR-SAFE-001).
@@ -41,8 +40,8 @@ type ResolveResult struct {
 	Destination domain.Destination
 }
 
-// MappingReader is the repository-only port this resolver depends on
-// (dependency inversion, matching CreationUseCase's MappingRepository).
+// MappingReader is the lookup port this resolver depends on (dependency
+// inversion, matching CreationUseCase's MappingRepository).
 // found=false with a nil error means no mapping exists for shortKey —
 // not an error at all, exactly like MappingRepository.Create's
 // exact-repeat outcome is not an error.
