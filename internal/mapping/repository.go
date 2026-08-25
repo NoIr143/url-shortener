@@ -50,30 +50,32 @@ var ErrKeyCollision = errors.New("mapping: short key already maps to a different
 
 const maxDestinationLength = 2048
 
-// Repository stores Mappings and Destination Claims in two DynamoDB
-// tables, committed transactionally.
+// Repository stores Mappings, Destination Claims, and Outbox Events in three
+// DynamoDB tables, committed transactionally.
 type Repository struct {
 	client       *dynamodb.Client
 	mappingTable string
 	claimTable   string
+	outboxTable  string
 	now          func() time.Time
 }
 
-func New(client *dynamodb.Client, mappingTable, claimTable string) *Repository {
+func New(client *dynamodb.Client, mappingTable, claimTable, outboxTable string) *Repository {
 	return &Repository{
 		client:       client,
 		mappingTable: mappingTable,
 		claimTable:   claimTable,
+		outboxTable:  outboxTable,
 		now:          time.Now,
 	}
 }
 
-// EnsureTables creates both tables if they do not already exist. Test
+// EnsureTables creates all repository tables if they do not already exist. Test
 // helper only — production table provisioning is infrastructure-as-code,
 // not application code.
 func (r *Repository) EnsureTables(ctx context.Context) error {
 	for _, t := range []string{r.mappingTable, r.claimTable} {
-		_, err := r.client.CreateTable(ctx, &dynamodb.CreateTableInput{
+		if err := r.ensureTable(ctx, &dynamodb.CreateTableInput{
 			TableName: aws.String(t),
 			AttributeDefinitions: []types.AttributeDefinition{
 				{AttributeName: aws.String("pk"), AttributeType: types.ScalarAttributeTypeS},
@@ -82,11 +84,44 @@ func (r *Repository) EnsureTables(ctx context.Context) error {
 				{AttributeName: aws.String("pk"), KeyType: types.KeyTypeHash},
 			},
 			BillingMode: types.BillingModePayPerRequest,
-		})
-		var inUse *types.ResourceInUseException
-		if err != nil && !errors.As(err, &inUse) {
-			return fmt.Errorf("create table %s: %w", t, err)
+		}); err != nil {
+			return err
 		}
+	}
+	if err := r.ensureTable(ctx, &dynamodb.CreateTableInput{
+		TableName: aws.String(r.outboxTable),
+		AttributeDefinitions: []types.AttributeDefinition{
+			{AttributeName: aws.String("aggregate_key"), AttributeType: types.ScalarAttributeTypeS},
+			{AttributeName: aws.String("event_key"), AttributeType: types.ScalarAttributeTypeS},
+			{AttributeName: aws.String("unpublished_shard"), AttributeType: types.ScalarAttributeTypeS},
+			{AttributeName: aws.String("unpublished_key"), AttributeType: types.ScalarAttributeTypeS},
+		},
+		KeySchema: []types.KeySchemaElement{
+			{AttributeName: aws.String("aggregate_key"), KeyType: types.KeyTypeHash},
+			{AttributeName: aws.String("event_key"), KeyType: types.KeyTypeRange},
+		},
+		GlobalSecondaryIndexes: []types.GlobalSecondaryIndex{
+			{
+				IndexName: aws.String("gsi_unpublished"),
+				KeySchema: []types.KeySchemaElement{
+					{AttributeName: aws.String("unpublished_shard"), KeyType: types.KeyTypeHash},
+					{AttributeName: aws.String("unpublished_key"), KeyType: types.KeyTypeRange},
+				},
+				Projection: &types.Projection{ProjectionType: types.ProjectionTypeAll},
+			},
+		},
+		BillingMode: types.BillingModePayPerRequest,
+	}); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (r *Repository) ensureTable(ctx context.Context, input *dynamodb.CreateTableInput) error {
+	_, err := r.client.CreateTable(ctx, input)
+	var inUse *types.ResourceInUseException
+	if err != nil && !errors.As(err, &inUse) {
+		return fmt.Errorf("create table %s: %w", aws.ToString(input.TableName), err)
 	}
 	return nil
 }
@@ -104,7 +139,8 @@ func digestOf(destination string) string {
 }
 
 // Create attempts to atomically commit a new Mapping (shortKey ->
-// destination) plus its Destination Claim. If a claim for the exact same
+// destination), its Destination Claim, and a destination-free Outbox Event.
+// If a claim for the exact same
 // destination (byte equality, per DR-005) already exists, it returns the
 // winning shortKey with Created=false instead of creating a second
 // mapping — this is FR-004/FR-005's concurrency invariant, enforced by a
@@ -115,6 +151,10 @@ func (r *Repository) Create(ctx context.Context, shortKey, destination string) (
 	}
 	digest := digestOf(destination)
 	createdAt := r.now().UTC().Format(time.RFC3339Nano)
+	outboxEvent, err := newMappingCreatedEvent(shortKey, createdAt)
+	if err != nil {
+		return CreateResult{}, err
+	}
 
 	mappingItem, err := attributevalue.MarshalMap(struct {
 		PK          string `dynamodbav:"pk"`
@@ -141,6 +181,10 @@ func (r *Repository) Create(ctx context.Context, shortKey, destination string) (
 	if err != nil {
 		return CreateResult{}, fmt.Errorf("marshal claim: %w", err)
 	}
+	outboxItem, err := attributevalue.MarshalMap(outboxEvent)
+	if err != nil {
+		return CreateResult{}, fmt.Errorf("marshal outbox event: %w", err)
+	}
 
 	_, err = r.client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{
 		TransactItems: []types.TransactWriteItem{
@@ -156,6 +200,13 @@ func (r *Repository) Create(ctx context.Context, shortKey, destination string) (
 					TableName:           aws.String(r.mappingTable),
 					Item:                mappingItem,
 					ConditionExpression: aws.String("attribute_not_exists(pk)"),
+				},
+			},
+			{
+				Put: &types.Put{
+					TableName:           aws.String(r.outboxTable),
+					Item:                outboxItem,
+					ConditionExpression: aws.String("attribute_not_exists(aggregate_key) AND attribute_not_exists(event_key)"),
 				},
 			},
 		},

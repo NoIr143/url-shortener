@@ -12,19 +12,26 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 )
 
-// snapshotRecord is a backup-format row for either table. Mapping-only state
-// is retained exactly so restore cannot silently reset lifecycle metadata.
+// snapshotRecord is a backup-format row for one repository table. Mapping and
+// outbox state are retained exactly so restore cannot silently reset metadata.
 type snapshotRecord struct {
-	Kind        string `json:"kind"` // "mapping" or "claim"
-	ShortKey    string `json:"shortKey,omitempty"`
-	Destination string `json:"destination,omitempty"`
-	Digest      string `json:"digest,omitempty"`
-	Status      string `json:"status,omitempty"`
-	Version     int64  `json:"version,omitempty"`
-	CreatedAt   string `json:"createdAt,omitempty"`
+	Kind             string `json:"kind"` // "mapping", "claim", or "outbox"
+	ShortKey         string `json:"shortKey,omitempty"`
+	Destination      string `json:"destination,omitempty"`
+	Digest           string `json:"digest,omitempty"`
+	Status           string `json:"status,omitempty"`
+	Version          int64  `json:"version,omitempty"`
+	CreatedAt        string `json:"createdAt,omitempty"`
+	EventKey         string `json:"eventKey,omitempty"`
+	EventID          string `json:"eventId,omitempty"`
+	EventType        string `json:"eventType,omitempty"`
+	SchemaVersion    int64  `json:"schemaVersion,omitempty"`
+	Payload          string `json:"payload,omitempty"`
+	UnpublishedShard string `json:"unpublishedShard,omitempty"`
+	UnpublishedKey   string `json:"unpublishedKey,omitempty"`
 }
 
-// Backup exports every Mapping and Destination Claim item as a JSON
+// Backup exports every Mapping, Destination Claim, and Outbox Event as a JSON
 // snapshot. This is a local-testing substitute for DynamoDB's managed
 // point-in-time recovery, which DynamoDB Local does not implement — it
 // proves the reconciliation *invariant* (DR-009: zero unexplained
@@ -72,6 +79,30 @@ func (r *Repository) Backup(ctx context.Context) ([]byte, error) {
 			return nil, fmt.Errorf("unmarshal claim for backup: %w", err)
 		}
 		records = append(records, snapshotRecord{Kind: "claim", Digest: c.PK, ShortKey: c.ShortKey, Destination: c.Destination})
+	}
+
+	outbox, err := r.client.Scan(ctx, &dynamodb.ScanInput{TableName: aws.String(r.outboxTable)})
+	if err != nil {
+		return nil, fmt.Errorf("scan outbox: %w", err)
+	}
+	for _, item := range outbox.Items {
+		var event OutboxEvent
+		if err := attributevalue.UnmarshalMap(item, &event); err != nil {
+			return nil, fmt.Errorf("unmarshal outbox event for backup: %w", err)
+		}
+		records = append(records, snapshotRecord{
+			Kind:             "outbox",
+			ShortKey:         event.AggregateKey,
+			Version:          event.AggregateVersion,
+			CreatedAt:        event.CreatedAt,
+			EventKey:         event.EventKey,
+			EventID:          event.EventID,
+			EventType:        event.EventType,
+			SchemaVersion:    event.SchemaVersion,
+			Payload:          event.Payload,
+			UnpublishedShard: event.UnpublishedShard,
+			UnpublishedKey:   event.UnpublishedKey,
+		})
 	}
 
 	return json.Marshal(records)
@@ -136,11 +167,47 @@ func (r *Repository) Restore(ctx context.Context, snapshot []byte) error {
 			}); err != nil {
 				return fmt.Errorf("restore claim %s: %w", rec.Digest, err)
 			}
+		case "outbox":
+			if rec.ShortKey == "" || rec.Version < 1 || rec.CreatedAt == "" || rec.EventKey == "" ||
+				rec.EventID == "" || rec.EventType == "" || rec.SchemaVersion < 1 || rec.Payload == "" ||
+				rec.UnpublishedShard == "" || rec.UnpublishedKey == "" {
+				return fmt.Errorf("restore outbox event %s: snapshot is missing event metadata", rec.EventID)
+			}
+			item, err := attributevalue.MarshalMap(OutboxEvent{
+				AggregateKey:     rec.ShortKey,
+				EventKey:         rec.EventKey,
+				AggregateVersion: rec.Version,
+				EventID:          rec.EventID,
+				EventType:        rec.EventType,
+				SchemaVersion:    rec.SchemaVersion,
+				Payload:          rec.Payload,
+				CreatedAt:        rec.CreatedAt,
+				UnpublishedShard: rec.UnpublishedShard,
+				UnpublishedKey:   rec.UnpublishedKey,
+			})
+			if err != nil {
+				return fmt.Errorf("marshal restored outbox event %s: %w", rec.EventID, err)
+			}
+			if _, err := r.client.PutItem(ctx, &dynamodb.PutItemInput{
+				TableName: aws.String(r.outboxTable), Item: item,
+			}); err != nil {
+				return fmt.Errorf("restore outbox event %s: %w", rec.EventID, err)
+			}
 		default:
 			return fmt.Errorf("unknown snapshot record kind %q", rec.Kind)
 		}
 	}
 	return nil
+}
+
+// CountOutboxItems returns the durable unpublished/published event count for
+// backup and reconciliation evidence.
+func (r *Repository) CountOutboxItems(ctx context.Context) (int, error) {
+	out, err := r.client.Scan(ctx, &dynamodb.ScanInput{TableName: aws.String(r.outboxTable), Select: types.SelectCount})
+	if err != nil {
+		return 0, fmt.Errorf("count outbox events: %w", err)
+	}
+	return int(out.Count), nil
 }
 
 // CountItems returns the number of items currently in each table — a

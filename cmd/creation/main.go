@@ -177,7 +177,7 @@ func (a *keyAllocatorAdapter) Next() (domain.ShortKey, error) {
 
 func main() {
 	client := dynamoClient()
-	repo := mapping.New(client, "mapping", "destination_claim")
+	repo := mapping.New(client, "mapping", "destination_claim", "outbox_event")
 	if err := repo.EnsureTables(context.Background()); err != nil {
 		log.Fatalf("ensure tables: %v", err)
 	}

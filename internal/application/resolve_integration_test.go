@@ -59,13 +59,15 @@ func TestResolveUseCase_RealRepository(t *testing.T) {
 	suffix := time.Now().UnixNano()
 	mappingTable := fmt.Sprintf("app_resolve_mapping_%d", suffix)
 	claimTable := fmt.Sprintf("app_resolve_claim_%d", suffix)
+	outboxTable := fmt.Sprintf("app_resolve_outbox_%d", suffix)
 
-	repo := mapping.New(client, mappingTable, claimTable)
+	repo := mapping.New(client, mappingTable, claimTable, outboxTable)
 	if err := repo.EnsureTables(context.Background()); err != nil {
 		t.Fatalf("ensure tables: %v", err)
 	}
 	deleteTable(t, client, mappingTable)
 	deleteTable(t, client, claimTable)
+	deleteTable(t, client, outboxTable)
 
 	uc := NewResolveUseCase(mappingReaderAdapter{repo: repo})
 

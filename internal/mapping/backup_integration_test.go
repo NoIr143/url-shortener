@@ -20,8 +20,10 @@ import (
 func TestBackupRestoreReconcile(t *testing.T) {
 	client := localClient(t)
 	suffix := time.Now().UnixNano()
-	srcMappingTable, srcClaimTable := fmt.Sprintf("backup_src_mapping_%d", suffix), fmt.Sprintf("backup_src_claim_%d", suffix)
-	src := New(client, srcMappingTable, srcClaimTable)
+	srcMappingTable := fmt.Sprintf("backup_src_mapping_%d", suffix)
+	srcClaimTable := fmt.Sprintf("backup_src_claim_%d", suffix)
+	srcOutboxTable := fmt.Sprintf("backup_src_outbox_%d", suffix)
+	src := New(client, srcMappingTable, srcClaimTable, srcOutboxTable)
 	fixedCreatedAt := time.Date(2026, time.August, 25, 2, 3, 4, 567890123, time.UTC)
 	src.now = func() time.Time { return fixedCreatedAt }
 	if err := src.EnsureTables(context.Background()); err != nil {
@@ -29,6 +31,7 @@ func TestBackupRestoreReconcile(t *testing.T) {
 	}
 	deleteTable(t, client, srcMappingTable)
 	deleteTable(t, client, srcClaimTable)
+	deleteTable(t, client, srcOutboxTable)
 
 	const n = 25
 	for i := 0; i < n; i++ {
@@ -47,13 +50,16 @@ func TestBackupRestoreReconcile(t *testing.T) {
 	// Simulate restoring into a freshly provisioned environment (new
 	// tables — the local substitute for "new AWS account/region" since
 	// DynamoDB Local has no cross-instance restore to exercise).
-	dstMappingTable, dstClaimTable := fmt.Sprintf("backup_dst_mapping_%d", suffix), fmt.Sprintf("backup_dst_claim_%d", suffix)
-	dst := New(client, dstMappingTable, dstClaimTable)
+	dstMappingTable := fmt.Sprintf("backup_dst_mapping_%d", suffix)
+	dstClaimTable := fmt.Sprintf("backup_dst_claim_%d", suffix)
+	dstOutboxTable := fmt.Sprintf("backup_dst_outbox_%d", suffix)
+	dst := New(client, dstMappingTable, dstClaimTable, dstOutboxTable)
 	if err := dst.EnsureTables(context.Background()); err != nil {
 		t.Fatalf("ensure destination tables: %v", err)
 	}
 	deleteTable(t, client, dstMappingTable)
 	deleteTable(t, client, dstClaimTable)
+	deleteTable(t, client, dstOutboxTable)
 	if err := dst.Restore(context.Background(), snapshot); err != nil {
 		t.Fatalf("restore: %v", err)
 	}
@@ -69,6 +75,17 @@ func TestBackupRestoreReconcile(t *testing.T) {
 	if srcMappingCount != dstMappingCount || srcClaimCount != dstClaimCount {
 		t.Fatalf("count mismatch after restore: src=(%d mappings,%d claims) dst=(%d mappings,%d claims)",
 			srcMappingCount, srcClaimCount, dstMappingCount, dstClaimCount)
+	}
+	srcOutboxCount, err := src.CountOutboxItems(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	dstOutboxCount, err := dst.CountOutboxItems(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if srcOutboxCount != n || dstOutboxCount != srcOutboxCount {
+		t.Fatalf("outbox count mismatch after restore: src=%d dst=%d want=%d", srcOutboxCount, dstOutboxCount, n)
 	}
 
 	for i := 0; i < n; i++ {
@@ -93,6 +110,11 @@ func TestBackupRestoreReconcile(t *testing.T) {
 		}
 		if record.Status != "Active" || record.Version != 1 || record.CreatedAt != fixedCreatedAt.Format(time.RFC3339Nano) {
 			t.Fatalf("restored mapping %s metadata mismatch: %+v", key, record)
+		}
+		event := readOutboxEvent(t, dst, key)
+		if event.AggregateVersion != 1 || event.EventType != MappingCreatedEventType ||
+			event.CreatedAt != fixedCreatedAt.Format(time.RFC3339Nano) {
+			t.Fatalf("restored mapping %s outbox mismatch: %+v", key, event)
 		}
 	}
 

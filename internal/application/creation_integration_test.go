@@ -126,14 +126,16 @@ func TestCreationUseCase_RealRepository(t *testing.T) {
 	suffix := time.Now().UnixNano()
 	mappingTable := fmt.Sprintf("app_creation_mapping_%d", suffix)
 	claimTable := fmt.Sprintf("app_creation_claim_%d", suffix)
+	outboxTable := fmt.Sprintf("app_creation_outbox_%d", suffix)
 	counterTable := fmt.Sprintf("app_creation_counter_%d", suffix)
 
-	repo := mapping.New(client, mappingTable, claimTable)
+	repo := mapping.New(client, mappingTable, claimTable, outboxTable)
 	if err := repo.EnsureTables(context.Background()); err != nil {
 		t.Fatalf("ensure tables: %v", err)
 	}
 	deleteTable(t, client, mappingTable)
 	deleteTable(t, client, claimTable)
+	deleteTable(t, client, outboxTable)
 
 	alloc := keyalloc.New(client, counterTable, 1_000_000)
 	if err := alloc.EnsureTable(context.Background()); err != nil {
