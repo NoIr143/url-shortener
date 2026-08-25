@@ -4,20 +4,10 @@
 // create a mapping even by mistake, since api.Resolver has no Create
 // method.
 //
-// T8-03: wired onto internal/application.ResolveUseCase (T8-02), a
-// repository-only resolver — internal/cache.RedirectCache (Valkey
-// cache-aside) is deliberately NOT wired in here. T9-06 ("Implement
-// Valkey status-aware cache-aside and bounded negative caching") is the
-// separate, later task that adds a cache layer back on top of this
-// resolver; until then every resolution reads DynamoDB directly. This
-// is a deliberate, task-breakdown-sequenced latency/read-load
-// trade-off, not a correctness regression — and it also happens to be
-// what actually fixes a real bug T8-01 found: the previous wiring
-// (*cache.RedirectCache passed directly as api.Resolver) didn't
-// correctly signal "not found" to the handler, so unknown keys
-// incorrectly returned 503 instead of 404. See
-// docs/poc/T8-01-short-key-parser.md and
-// docs/poc/T8-02-repository-only-redirect-resolver.md.
+// T9-06 layers internal/cache.RedirectCache over the T8-02 application
+// resolver. Valkey remains optional for correctness: unavailable, stale, or
+// corrupt cache state falls back to DynamoDB and ambiguous state never
+// redirects.
 //
 // Local dev requires DynamoDB Local: export DYNAMODB_ENDPOINT (e.g.
 // http://localhost:8000) or run via docker-compose.yml, which sets it
@@ -29,14 +19,17 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"time"
 
 	"url-shortener/internal/api"
 	"url-shortener/internal/application"
+	redirectcache "url-shortener/internal/cache"
 	"url-shortener/internal/domain"
 	"url-shortener/internal/mapping"
 
@@ -44,6 +37,7 @@ import (
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
+	"github.com/redis/go-redis/v9"
 )
 
 func dynamoClient() *dynamodb.Client {
@@ -65,7 +59,7 @@ func dynamoClient() *dynamodb.Client {
 	return dynamodb.NewFromConfig(cfg, func(o *dynamodb.Options) { o.BaseEndpoint = aws.String(endpoint) })
 }
 
-// mappingReaderAdapter satisfies application.MappingReader (T8-02) over
+// mappingReaderAdapter satisfies cache.Source over
 // a real *mapping.Repository, translating its raw-string
 // GetWithStatus into domain types — the use case itself never imports
 // internal/mapping. Promoted from internal/application's test-local
@@ -75,19 +69,44 @@ type mappingReaderAdapter struct {
 	repo *mapping.Repository
 }
 
-func (a mappingReaderAdapter) Get(ctx context.Context, shortKey domain.ShortKey) (domain.Destination, domain.Status, bool, error) {
+func (a mappingReaderAdapter) Get(ctx context.Context, shortKey domain.ShortKey) (domain.Destination, domain.Status, int64, bool, error) {
 	record, found, err := a.repo.GetWithStatus(ctx, shortKey.String())
 	if err != nil {
-		return domain.Destination{}, "", false, err
+		return domain.Destination{}, "", 0, false, err
 	}
 	if !found {
-		return domain.Destination{}, "", false, nil
+		return domain.Destination{}, "", 0, false, nil
 	}
 	dest, err := domain.NewDestination(record.Destination)
 	if err != nil {
-		return domain.Destination{}, "", false, fmt.Errorf("repository returned an invalid destination for key %q: %w", shortKey, err)
+		return domain.Destination{}, "", 0, false, fmt.Errorf("repository returned an invalid destination for key %q: %w", shortKey, err)
 	}
-	return dest, domain.Status(record.Status), true, nil
+	return dest, domain.Status(record.Status), record.Version, true, nil
+}
+
+func valkeyClient() (*redis.Client, error) {
+	options := &redis.Options{
+		Addr:         envOr("VALKEY_ADDR", "localhost:6379"),
+		DialTimeout:  250 * time.Millisecond,
+		ReadTimeout:  250 * time.Millisecond,
+		WriteTimeout: 250 * time.Millisecond,
+		MaxRetries:   -1,
+	}
+	tlsEnabled, err := strconv.ParseBool(envOr("VALKEY_TLS", "false"))
+	if err != nil {
+		return nil, fmt.Errorf("VALKEY_TLS must be a boolean: %w", err)
+	}
+	if tlsEnabled {
+		options.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12}
+	}
+	return redis.NewClient(options), nil
+}
+
+func envOr(name, fallback string) string {
+	if value := os.Getenv(name); value != "" {
+		return value
+	}
+	return fallback
 }
 
 func main() {
@@ -101,7 +120,15 @@ func main() {
 	// same table names at container start.
 	repo := mapping.New(dynamoClient(), "mapping", "destination_claim", "outbox_event")
 
-	useCase := application.NewResolveUseCase(mappingReaderAdapter{repo: repo})
+	valkey, err := valkeyClient()
+	if err != nil {
+		log.Fatalf("configure Valkey client: %v", err)
+	}
+	redirectCache, err := redirectcache.New(valkey, mappingReaderAdapter{repo: repo}, redirectcache.MaxMappingTTL, redirectcache.DefaultNegativeTTL)
+	if err != nil {
+		log.Fatalf("configure redirect cache: %v", err)
+	}
+	useCase := application.NewResolveUseCase(redirectCache)
 
 	resolveLimiter := api.NewIPRateLimiter(100, time.Minute)
 	resolveHandler := api.NewResolveHandler(useCase, resolveLimiter)

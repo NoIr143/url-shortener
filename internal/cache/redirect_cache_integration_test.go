@@ -1,94 +1,214 @@
 //go:build integration
 
-// Requires Valkey (docker compose -f docker-compose.yml up -d).
-// Run with: go test -tags=integration ./internal/cache/...
+// Requires Valkey: docker compose up -d valkey
 package cache
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"url-shortener/internal/domain"
+
 	"github.com/redis/go-redis/v9"
 )
 
-// fakeSource counts calls so tests can prove the cache actually absorbs
-// load (POC-003's hot-key requirement) rather than merely "not erroring".
-type fakeSource struct {
-	calls int64
-	data  map[string]string
+type sourceRecord struct {
+	destination domain.Destination
+	status      domain.Status
+	version     int64
+	found       bool
+	err         error
 }
 
-func (f *fakeSource) Get(ctx context.Context, key string) (string, bool, error) {
+type fakeSource struct {
+	calls   int64
+	records map[string]sourceRecord
+}
+
+var uniqueSequence uint64
+
+func (f *fakeSource) Get(_ context.Context, key domain.ShortKey) (domain.Destination, domain.Status, int64, bool, error) {
 	atomic.AddInt64(&f.calls, 1)
-	d, ok := f.data[key]
-	return d, ok, nil
+	record := f.records[key.String()]
+	return record.destination, record.status, record.version, record.found, record.err
 }
 
 func newValkeyClient(t *testing.T) *redis.Client {
 	t.Helper()
-	return redis.NewClient(&redis.Options{Addr: "localhost:6379"})
+	rdb := redis.NewClient(&redis.Options{Addr: "127.0.0.1:6379", MaxRetries: -1})
+	t.Cleanup(func() { _ = rdb.Close() })
+	if err := rdb.Ping(context.Background()).Err(); err != nil {
+		t.Fatalf("Valkey is required for integration tests: %v", err)
+	}
+	return rdb
 }
 
-func uniqueKey(prefix string) string {
-	return fmt.Sprintf("%s_%d", prefix, time.Now().UnixNano())
-}
-
-// TestMissThenHit proves the basic cache-aside contract: a first
-// read is a genuine miss (falls through to Source), a second read for the
-// same key is served from cache without calling Source again.
-func TestMissThenHit(t *testing.T) {
-	rdb := newValkeyClient(t)
-	src := &fakeSource{data: map[string]string{"k1": "https://example.com/1"}}
-	c := New(rdb, src, time.Minute)
-	key := uniqueKey("k1")
-	src.data[key] = "https://example.com/1"
-
-	dest1, fromCache1, err := c.Get(context.Background(), key)
+func testKey(t *testing.T, prefix string) domain.ShortKey {
+	t.Helper()
+	suffix := (time.Now().UnixNano() + int64(atomic.AddUint64(&uniqueSequence, 1))) % 1_000_000
+	key, err := domain.NewShortKey(fmt.Sprintf("%c%06d", prefix[0], suffix))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if fromCache1 {
-		t.Fatal("expected first read to be a genuine miss, not served from cache")
-	}
-	if dest1 != "https://example.com/1" {
-		t.Fatalf("unexpected destination: %q", dest1)
-	}
+	return key
+}
 
-	dest2, fromCache2, err := c.Get(context.Background(), key)
+func testDestination(t *testing.T, raw string) domain.Destination {
+	t.Helper()
+	destination, err := domain.NewDestination(raw)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !fromCache2 {
-		t.Fatal("expected second read to be served from cache")
-	}
-	if dest2 != dest1 {
-		t.Fatalf("cached value diverged: %q vs %q", dest2, dest1)
-	}
-	if atomic.LoadInt64(&src.calls) != 1 {
-		t.Fatalf("expected exactly 1 Source call (the miss), got %d", src.calls)
-	}
-	t.Log("PASS: first read = genuine miss (1 Source call), second read = cache hit (0 additional Source calls)")
+	return destination
 }
 
-// TestHotKeyAbsorbedByCache proves the hot-key requirement
-// (NFR-CAP-002's "representative hot-key mix"): many concurrent reads for
-// the same key should collapse to very few Source calls, not one per
-// request.
-func TestHotKeyAbsorbedByCache(t *testing.T) {
-	rdb := newValkeyClient(t)
-	key := uniqueKey("hot")
-	src := &fakeSource{data: map[string]string{key: "https://example.com/hot"}}
-	c := New(rdb, src, time.Minute)
-
-	// Prime the cache once, then hammer it concurrently.
-	if _, _, err := c.Get(context.Background(), key); err != nil {
+func newTestCache(t *testing.T, rdb *redis.Client, source Source, mappingTTL, negativeTTL time.Duration) *RedirectCache {
+	t.Helper()
+	c, err := New(rdb, source, mappingTTL, negativeTTL)
+	if err != nil {
 		t.Fatal(err)
 	}
-	callsBefore := atomic.LoadInt64(&src.calls)
+	return c
+}
+
+func TestActiveMissThenStatusAwareHit(t *testing.T) {
+	rdb := newValkeyClient(t)
+	key := testKey(t, "Active")
+	destination := testDestination(t, "https://example.com/active")
+	source := &fakeSource{records: map[string]sourceRecord{
+		key.String(): {destination: destination, status: domain.StatusActive, version: 7, found: true},
+	}}
+	c := newTestCache(t, rdb, source, time.Minute, DefaultNegativeTTL)
+
+	for attempt := 0; attempt < 2; attempt++ {
+		gotDestination, gotStatus, found, err := c.Get(context.Background(), key)
+		if err != nil || !found || gotStatus != domain.StatusActive || gotDestination != destination {
+			t.Fatalf("attempt %d: destination=%q status=%q found=%v err=%v", attempt+1, gotDestination, gotStatus, found, err)
+		}
+	}
+	if calls := atomic.LoadInt64(&source.calls); calls != 1 {
+		t.Fatalf("expected one authoritative read, got %d", calls)
+	}
+	ttl, err := rdb.TTL(context.Background(), keyPrefix+key.String()).Result()
+	if err != nil || ttl <= 0 || ttl > MaxMappingTTL {
+		t.Fatalf("unsafe mapping TTL %v (err=%v)", ttl, err)
+	}
+}
+
+func TestSuspendedEntryNeverReturnsOrCachesDestination(t *testing.T) {
+	rdb := newValkeyClient(t)
+	key := testKey(t, "Suspended")
+	const secretDestination = "https://example.com/must-not-leak"
+	source := &fakeSource{records: map[string]sourceRecord{
+		key.String(): {destination: testDestination(t, secretDestination), status: domain.StatusSuspended, version: 3, found: true},
+	}}
+	c := newTestCache(t, rdb, source, time.Minute, DefaultNegativeTTL)
+
+	for attempt := 0; attempt < 2; attempt++ {
+		destination, status, found, err := c.Get(context.Background(), key)
+		if err != nil || !found || status != domain.StatusSuspended || destination.String() != "" {
+			t.Fatalf("attempt %d leaked/changed suspended result: destination=%q status=%q found=%v err=%v", attempt+1, destination, status, found, err)
+		}
+	}
+	encoded, err := rdb.Get(context.Background(), keyPrefix+key.String()).Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(encoded, secretDestination) {
+		t.Fatal("suspended cache payload contains the destination")
+	}
+}
+
+func TestNegativeCacheIsBoundedAndExpires(t *testing.T) {
+	rdb := newValkeyClient(t)
+	key := testKey(t, "Unknown")
+	source := &fakeSource{records: map[string]sourceRecord{}}
+	c := newTestCache(t, rdb, source, time.Minute, 50*time.Millisecond)
+
+	for attempt := 0; attempt < 2; attempt++ {
+		_, _, found, err := c.Get(context.Background(), key)
+		if err != nil || found {
+			t.Fatalf("attempt %d: found=%v err=%v", attempt+1, found, err)
+		}
+	}
+	if calls := atomic.LoadInt64(&source.calls); calls != 1 {
+		t.Fatalf("negative hit should avoid a second source read; got %d calls", calls)
+	}
+
+	time.Sleep(80 * time.Millisecond)
+	if _, _, found, err := c.Get(context.Background(), key); err != nil || found {
+		t.Fatalf("post-expiry lookup: found=%v err=%v", found, err)
+	}
+	if calls := atomic.LoadInt64(&source.calls); calls != 2 {
+		t.Fatalf("expired negative entry must fall back; got %d calls", calls)
+	}
+}
+
+func TestStaleAndCorruptEntriesFallBackAuthoritatively(t *testing.T) {
+	for name, payload := range map[string]string{
+		"stale":   `{"schema_version":1,"kind":"mapping","destination":"https://attacker.invalid","status":"Active","version":1,"expires_at":"2000-01-01T00:00:00Z"}`,
+		"corrupt": `{"schema_version":1,"kind":"mapping","status":"Active","version":1,"expires_at":"2999-01-01T00:00:00Z","unexpected":true}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			rdb := newValkeyClient(t)
+			key := testKey(t, "Fallback")
+			destination := testDestination(t, "https://example.com/authoritative")
+			source := &fakeSource{records: map[string]sourceRecord{
+				key.String(): {destination: destination, status: domain.StatusActive, version: 9, found: true},
+			}}
+			c := newTestCache(t, rdb, source, time.Minute, DefaultNegativeTTL)
+			if err := rdb.Set(context.Background(), keyPrefix+key.String(), payload, time.Minute).Err(); err != nil {
+				t.Fatal(err)
+			}
+
+			gotDestination, status, found, err := c.Get(context.Background(), key)
+			if err != nil || !found || status != domain.StatusActive || gotDestination != destination {
+				t.Fatalf("unsafe fallback: destination=%q status=%q found=%v err=%v", gotDestination, status, found, err)
+			}
+			if calls := atomic.LoadInt64(&source.calls); calls != 1 {
+				t.Fatalf("expected authoritative fallback, got %d calls", calls)
+			}
+		})
+	}
+}
+
+func TestCacheUnavailableFallsBackAndRepositoryFailureFailsClosed(t *testing.T) {
+	broken := redis.NewClient(&redis.Options{Addr: "127.0.0.1:1", DialTimeout: 50 * time.Millisecond, MaxRetries: -1})
+	key := testKey(t, "Unavailable")
+	destination := testDestination(t, "https://example.com/fallback")
+	source := &fakeSource{records: map[string]sourceRecord{
+		key.String(): {destination: destination, status: domain.StatusActive, version: 1, found: true},
+	}}
+	c := newTestCache(t, broken, source, time.Minute, DefaultNegativeTTL)
+
+	gotDestination, status, found, err := c.Get(context.Background(), key)
+	if err != nil || !found || status != domain.StatusActive || gotDestination != destination {
+		t.Fatalf("cache-outage fallback failed: destination=%q status=%q found=%v err=%v", gotDestination, status, found, err)
+	}
+
+	source.records[key.String()] = sourceRecord{err: errors.New("repository unavailable")}
+	destinationAfterFailure, statusAfterFailure, foundAfterFailure, err := c.Get(context.Background(), key)
+	if err == nil || foundAfterFailure || statusAfterFailure != "" || destinationAfterFailure.String() != "" {
+		t.Fatalf("repository failure did not fail closed: destination=%q status=%q found=%v err=%v", destinationAfterFailure, statusAfterFailure, foundAfterFailure, err)
+	}
+}
+
+func TestHotKeyAndExplicitInvalidation(t *testing.T) {
+	rdb := newValkeyClient(t)
+	key := testKey(t, "HotKey")
+	source := &fakeSource{records: map[string]sourceRecord{
+		key.String(): {destination: testDestination(t, "https://example.com/hot"), status: domain.StatusActive, version: 1, found: true},
+	}}
+	c := newTestCache(t, rdb, source, time.Minute, DefaultNegativeTTL)
+	if _, _, _, err := c.Get(context.Background(), key); err != nil {
+		t.Fatal(err)
+	}
 
 	const concurrency = 200
 	var wg sync.WaitGroup
@@ -96,82 +216,74 @@ func TestHotKeyAbsorbedByCache(t *testing.T) {
 	for i := 0; i < concurrency; i++ {
 		go func() {
 			defer wg.Done()
-			if _, _, err := c.Get(context.Background(), key); err != nil {
+			if _, _, _, err := c.Get(context.Background(), key); err != nil {
 				t.Error(err)
 			}
 		}()
 	}
 	wg.Wait()
-
-	callsAfter := atomic.LoadInt64(&src.calls)
-	if callsAfter != callsBefore {
-		t.Fatalf("expected zero additional Source calls once primed, got %d additional calls across %d concurrent reads", callsAfter-callsBefore, concurrency)
-	}
-	t.Logf("PASS: %d concurrent hot-key reads produced 0 additional Source calls beyond the initial prime", concurrency)
-}
-
-// TestCacheFailureFallsBackSafely simulates the cache being
-// unavailable (wrong address, immediate connection failure) and proves
-// reads still succeed via the authoritative Source rather than erroring.
-func TestCacheFailureFallsBackSafely(t *testing.T) {
-	brokenRdb := redis.NewClient(&redis.Options{
-		Addr:        "localhost:1", // nothing listens here
-		DialTimeout: 200 * time.Millisecond,
-	})
-	key := uniqueKey("fail")
-	src := &fakeSource{data: map[string]string{key: "https://example.com/fallback"}}
-	c := New(brokenRdb, src, time.Minute)
-
-	dest, fromCache, err := c.Get(context.Background(), key)
-	if err != nil {
-		t.Fatalf("expected safe fallback on cache failure, got error: %v", err)
-	}
-	if fromCache {
-		t.Fatal("a broken cache cannot have served this from cache")
-	}
-	if dest != "https://example.com/fallback" {
-		t.Fatalf("unexpected destination: %q", dest)
-	}
-	t.Log("PASS: cache connection failure degraded safely to the authoritative Source, no error surfaced")
-}
-
-// TestSuspensionPropagation measures explicit-invalidation latency
-// (the privileged suspend path) and confirms it is nowhere near the
-// 60-second target in docs/decisions/DEC-008.md — explicit invalidation is
-// the fast path; TTL expiry (not exercised here at the real 60s value, to
-// keep the test fast) is the worst-case bound.
-func TestSuspensionPropagation(t *testing.T) {
-	rdb := newValkeyClient(t)
-	key := uniqueKey("suspend")
-	src := &fakeSource{data: map[string]string{key: "https://example.com/before-suspend"}}
-	c := New(rdb, src, time.Minute)
-
-	if _, _, err := c.Get(context.Background(), key); err != nil {
-		t.Fatal(err)
-	}
-	// Confirm it is actually cached before measuring invalidation.
-	_, fromCache, err := c.Get(context.Background(), key)
-	if err != nil || !fromCache {
-		t.Fatalf("expected key to be cached before invalidation test, fromCache=%v err=%v", fromCache, err)
+	if calls := atomic.LoadInt64(&source.calls); calls != 1 {
+		t.Fatalf("hot cache caused %d authoritative reads", calls)
 	}
 
-	start := time.Now()
 	if err := c.Invalidate(context.Background(), key); err != nil {
 		t.Fatal(err)
 	}
-	elapsed := time.Since(start)
+	source.records[key.String()] = sourceRecord{status: domain.StatusSuspended, version: 2, found: true}
+	destination, status, found, err := c.Get(context.Background(), key)
+	if err != nil || !found || status != domain.StatusSuspended || destination.String() != "" {
+		t.Fatalf("invalidation did not reveal suspension safely: destination=%q status=%q found=%v err=%v", destination, status, found, err)
+	}
+}
 
-	_, fromCacheAfter, err := c.Get(context.Background(), key)
+func TestCacheKeysPreserveShortKeyCase(t *testing.T) {
+	rdb := newValkeyClient(t)
+	upper, err := domain.NewShortKey("Aa00001")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if fromCacheAfter {
-		t.Fatal("expected a cache miss immediately after explicit invalidation")
+	lower, err := domain.NewShortKey("aa00001")
+	if err != nil {
+		t.Fatal(err)
 	}
+	upperDestination := testDestination(t, "https://example.com/upper")
+	lowerDestination := testDestination(t, "https://example.com/lower")
+	if err := rdb.Del(context.Background(), keyPrefix+upper.String(), keyPrefix+lower.String()).Err(); err != nil {
+		t.Fatal(err)
+	}
+	source := &fakeSource{records: map[string]sourceRecord{
+		upper.String(): {destination: upperDestination, status: domain.StatusActive, version: 1, found: true},
+		lower.String(): {destination: lowerDestination, status: domain.StatusActive, version: 1, found: true},
+	}}
+	c := newTestCache(t, rdb, source, time.Minute, DefaultNegativeTTL)
 
-	const target = 60 * time.Second
-	if elapsed >= target {
-		t.Fatalf("explicit invalidation took %v, at or beyond the 60s DEC-008 target", elapsed)
+	for _, test := range []struct {
+		key         domain.ShortKey
+		destination domain.Destination
+	}{{upper, upperDestination}, {lower, lowerDestination}, {upper, upperDestination}, {lower, lowerDestination}} {
+		destination, status, found, getErr := c.Get(context.Background(), test.key)
+		if getErr != nil || !found || status != domain.StatusActive || destination != test.destination {
+			t.Fatalf("case-sensitive lookup changed: key=%q destination=%q status=%q found=%v err=%v", test.key, destination, status, found, getErr)
+		}
 	}
-	t.Logf("PASS: explicit invalidation completed in %v (DEC-008 target: <%v); this measures local Valkey round-trip only, not a distributed production deployment", elapsed, target)
+	if calls := atomic.LoadInt64(&source.calls); calls != 2 {
+		t.Fatalf("upper/lower keys did not receive independent cache entries: source calls=%d", calls)
+	}
+}
+
+func TestInvalidAuthoritativeRecordIsNotCached(t *testing.T) {
+	rdb := newValkeyClient(t)
+	key := testKey(t, "Invalid")
+	source := &fakeSource{records: map[string]sourceRecord{
+		key.String(): {destination: testDestination(t, "https://example.com"), status: domain.StatusActive, version: 0, found: true},
+	}}
+	c := newTestCache(t, rdb, source, time.Minute, DefaultNegativeTTL)
+
+	destination, status, found, err := c.Get(context.Background(), key)
+	if !errors.Is(err, ErrInvalidSourceRecord) || found || status != "" || destination.String() != "" {
+		t.Fatalf("invalid source record did not fail closed: destination=%q status=%q found=%v err=%v", destination, status, found, err)
+	}
+	if exists, existsErr := rdb.Exists(context.Background(), keyPrefix+key.String()).Result(); existsErr != nil || exists != 0 {
+		t.Fatalf("invalid source record was cached: exists=%d err=%v", exists, existsErr)
+	}
 }
