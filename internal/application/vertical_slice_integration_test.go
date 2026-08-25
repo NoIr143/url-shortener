@@ -38,6 +38,7 @@ type verticalSliceTables struct {
 	client       *dynamodb.Client
 	mappingTable string
 	claimTable   string
+	outboxTable  string
 }
 
 func newVerticalSliceRepo(t *testing.T) (verticalSliceTables, *mapping.Repository, *keyalloc.Allocator) {
@@ -46,14 +47,16 @@ func newVerticalSliceRepo(t *testing.T) (verticalSliceTables, *mapping.Repositor
 	suffix := time.Now().UnixNano()
 	mappingTable := fmt.Sprintf("app_e2e_mapping_%d", suffix)
 	claimTable := fmt.Sprintf("app_e2e_claim_%d", suffix)
+	outboxTable := fmt.Sprintf("app_e2e_outbox_%d", suffix)
 	counterTable := fmt.Sprintf("app_e2e_counter_%d", suffix)
 
-	repo := mapping.New(client, mappingTable, claimTable)
+	repo := mapping.New(client, mappingTable, claimTable, outboxTable)
 	if err := repo.EnsureTables(context.Background()); err != nil {
 		t.Fatalf("ensure tables: %v", err)
 	}
 	deleteTable(t, client, mappingTable)
 	deleteTable(t, client, claimTable)
+	deleteTable(t, client, outboxTable)
 
 	alloc := keyalloc.New(client, counterTable, 1_000_000)
 	if err := alloc.EnsureTable(context.Background()); err != nil {
@@ -61,7 +64,7 @@ func newVerticalSliceRepo(t *testing.T) (verticalSliceTables, *mapping.Repositor
 	}
 	deleteTable(t, client, counterTable)
 
-	return verticalSliceTables{client: client, mappingTable: mappingTable, claimTable: claimTable}, repo, alloc
+	return verticalSliceTables{client: client, mappingTable: mappingTable, claimTable: claimTable, outboxTable: outboxTable}, repo, alloc
 }
 
 // recordingKeyGenerator wraps a real KeyGenerator and remembers every
@@ -191,7 +194,7 @@ func TestVerticalSlice_RestartPersistence(t *testing.T) {
 
 	// "Restart": a brand-new Repository value, pointed at the identical
 	// tables, sharing no in-memory state with the one Create used above.
-	restartedRepo := mapping.New(tables.client, tables.mappingTable, tables.claimTable)
+	restartedRepo := mapping.New(tables.client, tables.mappingTable, tables.claimTable, tables.outboxTable)
 	restartedResolveUC := NewResolveUseCase(mappingReaderAdapter{repo: restartedRepo})
 
 	resolved, err := restartedResolveUC.Resolve(context.Background(), result.ShortKey)

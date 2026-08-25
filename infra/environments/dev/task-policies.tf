@@ -3,8 +3,8 @@
 # DynamoDB calls each service's Go code makes (internal/mapping,
 # internal/keyalloc), not a blanket policy:
 #
-#   - creation (cmd/creation): Create() commits mapping+destination_claim
-#     in one TransactWriteItems (internal/mapping/repository.go), and
+#   - creation (cmd/creation): Create() commits mapping+destination_claim+
+#     outbox_event in one TransactWriteItems (internal/mapping/repository.go), and
 #     falls back to GetItem on destination_claim when the transaction is
 #     canceled by an exact-repeat. Key allocation (internal/keyalloc)
 #     does PutItem/GetItem/UpdateItem on id_lease_counter only.
@@ -17,8 +17,8 @@
 # current task provisions DynamoDB via IaC (flagged in
 # docs/poc/T5-05-vpc-alb-ecs.md). These ARNs are constructed against the
 # exact table names the Go code already hardcodes ("mapping",
-# "destination_claim", "id_lease_counter"), so the grant is correct the
-# moment those tables are created, in whatever future task does that.
+# "destination_claim", "outbox_event", "id_lease_counter"), so the grant is
+# correct the moment those tables are created, in whatever future task does that.
 #
 # dynamodb:CreateTable is deliberately NOT granted, even though
 # EnsureTables (both repository.go and allocator.go) calls it on
@@ -31,12 +31,13 @@
 locals {
   mapping_table_arn           = "arn:aws:dynamodb:${var.region}:${data.aws_caller_identity.current.account_id}:table/mapping"
   destination_claim_table_arn = "arn:aws:dynamodb:${var.region}:${data.aws_caller_identity.current.account_id}:table/destination_claim"
+  outbox_event_table_arn      = "arn:aws:dynamodb:${var.region}:${data.aws_caller_identity.current.account_id}:table/outbox_event"
   id_lease_counter_table_arn  = "arn:aws:dynamodb:${var.region}:${data.aws_caller_identity.current.account_id}:table/id_lease_counter"
 }
 
 data "aws_iam_policy_document" "creation_dynamodb" {
   statement {
-    sid    = "MappingAndClaimTransactionalWrite"
+    sid    = "MappingClaimOutboxTransactionalWrite"
     effect = "Allow"
     actions = [
       "dynamodb:TransactWriteItems",
@@ -46,6 +47,7 @@ data "aws_iam_policy_document" "creation_dynamodb" {
     resources = [
       local.mapping_table_arn,
       local.destination_claim_table_arn,
+      local.outbox_event_table_arn,
     ]
   }
 

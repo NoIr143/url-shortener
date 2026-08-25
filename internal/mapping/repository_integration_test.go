@@ -22,6 +22,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 )
@@ -66,13 +67,16 @@ func freshRepo(t *testing.T) *Repository {
 	t.Helper()
 	client := localClient(t)
 	suffix := time.Now().UnixNano()
-	mappingTable, claimTable := fmt.Sprintf("repo_mapping_%d", suffix), fmt.Sprintf("repo_claim_%d", suffix)
-	r := New(client, mappingTable, claimTable)
+	mappingTable := fmt.Sprintf("repo_mapping_%d", suffix)
+	claimTable := fmt.Sprintf("repo_claim_%d", suffix)
+	outboxTable := fmt.Sprintf("repo_outbox_%d", suffix)
+	r := New(client, mappingTable, claimTable, outboxTable)
 	if err := r.EnsureTables(context.Background()); err != nil {
 		t.Fatalf("ensure tables: %v", err)
 	}
 	deleteTable(t, client, mappingTable)
 	deleteTable(t, client, claimTable)
+	deleteTable(t, client, outboxTable)
 	return r
 }
 
@@ -116,6 +120,16 @@ func TestConcurrentExactRepeatYieldsOneMapping(t *testing.T) {
 	}
 	if len(winners) != 1 {
 		t.Fatalf("expected all %d goroutines to agree on one short key, got %d distinct keys: %v", goroutines, len(winners), winners)
+	}
+	outboxItems, err := r.client.Scan(context.Background(), &dynamodb.ScanInput{
+		TableName: aws.String(r.outboxTable),
+		Select:    types.SelectCount,
+	})
+	if err != nil {
+		t.Fatalf("count concurrent-repeat outbox events: %v", err)
+	}
+	if outboxItems.Count != 1 {
+		t.Fatalf("expected exactly one outbox event for %d concurrent repeats, got %d", goroutines, outboxItems.Count)
 	}
 	t.Logf("PASS: %d concurrent exact-repeat requests converged on exactly one mapping and one key", goroutines)
 }
@@ -191,12 +205,136 @@ func TestCreationMetadataIsAtomicAndImmutable(t *testing.T) {
 		t.Fatalf("unexpected exact-repeat result: %+v", repeated)
 	}
 	assertMetadata("exact repeat")
+	assertOutboxMissing(t, r, "unused2")
 
 	_, err = r.Create(context.Background(), key, "https://example.com/different")
 	if !errors.Is(err, ErrKeyCollision) {
 		t.Fatalf("expected ErrKeyCollision, got %v", err)
 	}
 	assertMetadata("rejected key collision")
+}
+
+// TestCreateCommitsDestinationFreeOutboxEvent proves DATA-005/ADR-005's
+// creation boundary: mapping, claim, and one versioned propagation intent are
+// committed together. The event carries only allowlisted mapping metadata and
+// never copies the sensitive destination URL.
+func TestCreateCommitsDestinationFreeOutboxEvent(t *testing.T) {
+	r := freshRepo(t)
+	fixedTime := time.Date(2026, time.August, 25, 12, 30, 45, 123456789, time.UTC)
+	r.now = func() time.Time { return fixedTime }
+	const (
+		key         = "outbox1"
+		destination = "https://example.com/private?token=must-not-enter-outbox"
+	)
+
+	if _, err := r.Create(context.Background(), key, destination); err != nil {
+		t.Fatalf("create mapping with outbox: %v", err)
+	}
+	event := readOutboxEvent(t, r, key)
+	wantCreatedAt := fixedTime.Format(time.RFC3339Nano)
+	if event.AggregateKey != key || event.AggregateVersion != 1 || event.EventType != MappingCreatedEventType ||
+		event.SchemaVersion != OutboxSchemaVersion || event.CreatedAt != wantCreatedAt {
+		t.Fatalf("unexpected outbox envelope: %+v", event)
+	}
+	if event.EventKey != "00000000000000000001#MappingCreated" {
+		t.Fatalf("unexpected event key: %q", event.EventKey)
+	}
+	if event.UnpublishedKey != event.CreatedAt+"#"+event.EventID {
+		t.Fatalf("unpublished key does not preserve time/event ordering: %+v", event)
+	}
+	if len(event.UnpublishedShard) != 2 || event.UnpublishedShard < "00" || event.UnpublishedShard > "15" {
+		t.Fatalf("outbox shard is outside the 16-shard contract: %q", event.UnpublishedShard)
+	}
+	wantPayload := `{"shortKey":"outbox1","status":"Active","version":1}`
+	if event.Payload != wantPayload {
+		t.Fatalf("unexpected mapping-created payload: got %q want %q", event.Payload, wantPayload)
+	}
+	if strings.Contains(event.Payload, destination) || strings.Contains(event.Payload, "must-not-enter-outbox") {
+		t.Fatalf("outbox payload leaked destination data: %q", event.Payload)
+	}
+}
+
+// TestMissingOutboxTableRollsBackMappingAndClaim proves there is no dual-write
+// window. If the event cannot be committed, neither authoritative item exists;
+// once the dependency recovers, a retry commits all three items successfully.
+func TestMissingOutboxTableRollsBackMappingAndClaim(t *testing.T) {
+	r := freshRepo(t)
+	broken := New(r.client, r.mappingTable, r.claimTable, "missing_outbox_"+fmt.Sprint(time.Now().UnixNano()))
+	const (
+		key         = "atomic1"
+		destination = "https://example.com/outbox-atomicity"
+	)
+
+	if _, err := broken.Create(context.Background(), key, destination); err == nil {
+		t.Fatal("expected create to fail while the outbox table is unavailable")
+	}
+	assertItemMissing(t, r.client, r.mappingTable, "pk", key)
+	assertItemMissing(t, r.client, r.claimTable, "pk", digestOf(destination))
+
+	result, err := r.Create(context.Background(), key, destination)
+	if err != nil {
+		t.Fatalf("retry after outbox recovery: %v", err)
+	}
+	if !result.Created || result.ShortKey != key {
+		t.Fatalf("unexpected recovery result: %+v", result)
+	}
+	readOutboxEvent(t, r, key)
+}
+
+func readOutboxEvent(t *testing.T, r *Repository, shortKey string) OutboxEvent {
+	t.Helper()
+	out, err := r.client.GetItem(context.Background(), &dynamodb.GetItemInput{
+		TableName: aws.String(r.outboxTable),
+		Key: map[string]types.AttributeValue{
+			"aggregate_key": &types.AttributeValueMemberS{Value: shortKey},
+			"event_key":     &types.AttributeValueMemberS{Value: "00000000000000000001#MappingCreated"},
+		},
+		ConsistentRead: aws.Bool(true),
+	})
+	if err != nil {
+		t.Fatalf("read mapping-created outbox event: %v", err)
+	}
+	if out.Item == nil {
+		t.Fatalf("mapping-created outbox event for %q is missing", shortKey)
+	}
+	var event OutboxEvent
+	if err := attributevalue.UnmarshalMap(out.Item, &event); err != nil {
+		t.Fatalf("unmarshal mapping-created outbox event: %v", err)
+	}
+	return event
+}
+
+func assertItemMissing(t *testing.T, client *dynamodb.Client, table, keyName, keyValue string) {
+	t.Helper()
+	out, err := client.GetItem(context.Background(), &dynamodb.GetItemInput{
+		TableName:      aws.String(table),
+		Key:            map[string]types.AttributeValue{keyName: &types.AttributeValueMemberS{Value: keyValue}},
+		ConsistentRead: aws.Bool(true),
+	})
+	if err != nil {
+		t.Fatalf("read %s after rolled-back transaction: %v", table, err)
+	}
+	if out.Item != nil {
+		t.Fatalf("rolled-back transaction left an item in %s: %#v", table, out.Item)
+	}
+}
+
+func assertOutboxMissing(t *testing.T, r *Repository, shortKey string) {
+	t.Helper()
+	out, err := r.client.GetItem(context.Background(), &dynamodb.GetItemInput{
+		TableName: aws.String(r.outboxTable),
+		Key: map[string]types.AttributeValue{
+			"aggregate_key": &types.AttributeValueMemberS{Value: shortKey},
+			"event_key":     &types.AttributeValueMemberS{Value: "00000000000000000001#MappingCreated"},
+		},
+		ConsistentRead: aws.Bool(true),
+	})
+	if err != nil {
+		t.Fatalf("read outbox event expected to be absent: %v", err)
+	}
+	if out.Item != nil {
+		t.Fatalf("rejected candidate %q left a partial outbox event: %#v", shortKey, out.Item)
+	}
 }
 
 // TestConcurrentSameKeyDifferentDestinationsCommitsOneMapping is T9-02's
@@ -539,6 +677,7 @@ func TestDigestCollisionFailsClosedWithoutPartialMapping(t *testing.T) {
 	if !found || original != storedDestination {
 		t.Fatalf("original mapping changed: found=%v destination=%q", found, original)
 	}
+	assertOutboxMissing(t, r, candidateKey)
 }
 
 // TestForcedKeyCollisionRejectedSafely is T7-03's evidence: a genuine

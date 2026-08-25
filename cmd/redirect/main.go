@@ -99,7 +99,7 @@ func main() {
 	// fatal-crash on startup in a real deployment (AccessDenied) and, in
 	// local Compose, race cmd/creation's own EnsureTables call on the
 	// same table names at container start.
-	repo := mapping.New(dynamoClient(), "mapping", "destination_claim")
+	repo := mapping.New(dynamoClient(), "mapping", "destination_claim", "outbox_event")
 
 	useCase := application.NewResolveUseCase(mappingReaderAdapter{repo: repo})
 
