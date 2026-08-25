@@ -14,7 +14,7 @@ name: ephemeral-integration-test
 # order every OIDC role in this repo has required (T5-02/03/07).
 #
 # No DynamoDB table is created by this workflow itself: the
-# internal/mapping and internal/keyalloc *_integration_test.go suites
+# internal/mapping, internal/keyalloc, and internal/worker integration suites
 # each create their own uniquely-named table and delete it in
 # t.Cleanup. DYNAMODB_ENDPOINT is deliberately left unset so those
 # tests' client-setup helpers resolve real AWS credentials/region from
@@ -44,4 +44,4 @@ jobs:
           go-version-file: go.mod
 
       - name: Run DynamoDB integration tests against real AWS
-        run: go test -tags=integration -v ./internal/mapping/... ./internal/keyalloc/...
+        run: go test -tags=integration -v ./internal/mapping/... ./internal/keyalloc/... ./internal/worker/...

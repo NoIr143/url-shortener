@@ -27,7 +27,7 @@ data "aws_iam_openid_connect_provider" "github_actions" {
 }
 
 # Wildcard resource patterns matching the exact test-table naming
-# conventions already in the codebase (repo_*, backup_*, keyalloc_*) —
+# conventions already in the codebase (repo_*, backup_*, keyalloc_*, worker_*) —
 # this role can never touch the real "mapping"/"destination_claim"/
 # "id_lease_counter" table names T5-07's task-role policies reference,
 # even though both grant DynamoDB actions in the same account/region.
@@ -36,6 +36,7 @@ locals {
     "arn:aws:dynamodb:${var.region}:${data.aws_caller_identity.current.account_id}:table/repo_*",
     "arn:aws:dynamodb:${var.region}:${data.aws_caller_identity.current.account_id}:table/backup_*",
     "arn:aws:dynamodb:${var.region}:${data.aws_caller_identity.current.account_id}:table/keyalloc_*",
+    "arn:aws:dynamodb:${var.region}:${data.aws_caller_identity.current.account_id}:table/worker_*",
   ]
 }
 
